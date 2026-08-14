@@ -9,10 +9,11 @@
  *   node withdraw-assets.js --withdraw --confirm
  *   node withdraw-assets.js --all --confirm
  *
- * Why this does not send every coin to the 0x address:
- *   LD* balances are Simple Earn, not withdrawable coins.
- *   NEAR / LUNA / BTC / SOLO use non-EVM addresses. Sending them to 0x can lose funds.
- *   The only safe way to get everything to one 0x wallet is redeem → sell to USDT → withdraw USDT.
+ * Routing:
+ *   NEAR  → NEAR_ADDRESS on NEAR network (do not sell)
+ *   USDT  → EVM_ADDRESS on BSC/ETH
+ *   other tradeable coins → sell to USDT, then withdraw USDT
+ *   LD*   → redeem Simple Earn first
  */
 
 const crypto = require('crypto');
@@ -21,11 +22,15 @@ const https = require('https');
 // ========== CONFIG ==========
 const API_KEY = process.env.BINANCE_API_KEY || 'YOUR_API_KEY_HERE';
 const API_SECRET = process.env.BINANCE_API_SECRET || 'YOUR_SECRET_KEY_HERE';
-const WITHDRAW_ADDRESS =
+const EVM_ADDRESS =
   process.env.WITHDRAW_ADDRESS || '0x8fFE47791c35Bc7995aA899Be07a42a4Eb3F8701';
+const NEAR_ADDRESS =
+  process.env.NEAR_ADDRESS ||
+  '50d977e40268ede1640f9c49c4a7656f447d82399b3554bda1e5a10c60db5416';
 // BEP20 (BSC) is cheap and uses the same 0x address. Add BNB Smart Chain in MetaMask first.
 // Use 'ETH' if you only want Ethereum mainnet (higher fee).
 const USDT_NETWORK = process.env.USDT_NETWORK || 'BSC';
+const NEAR_NETWORK = process.env.NEAR_NETWORK || 'NEAR';
 const BASE_URL = 'api.binance.com';
 const RECV_WINDOW = 60000;
 // ============================
@@ -37,6 +42,7 @@ const FLAG_SELL = args.includes('--sell-to-usdt') || args.includes('--all');
 const FLAG_WITHDRAW = args.includes('--withdraw') || args.includes('--all');
 
 const LD_PREFIX = 'LD';
+const KEEP_NATIVE = new Set(['NEAR', 'USDT']);
 const STABLE = new Set(['USDT', 'USDC', 'FDUSD', 'BUSD', 'TUSD', 'DAI']);
 const FALLBACK_USD = {
   SOLO: 0.01262,
@@ -218,16 +224,17 @@ async function printValuation(balances, prices) {
 }
 
 function printPlan(rows) {
-  console.log('\n=== Withdrawal plan to', WITHDRAW_ADDRESS, '===\n');
-  console.log('This address is an EVM 0x address (Ethereum / BSC / Polygon / Flare / Sonic).');
-  console.log('It is NOT valid for native BTC, NEAR, LUNA, or SOLO (XRP ledger).\n');
-
+  console.log('\n=== Withdrawal plan ===\n');
+  console.log('NEAR →', NEAR_ADDRESS, `(${NEAR_NETWORK})`);
+  console.log('USDT →', EVM_ADDRESS, `(${USDT_NETWORK})`);
+  console.log('');
   console.log('Recommended path:');
   console.log('  1. Redeem Simple Earn (LD*) back to spot.');
-  console.log('  2. Market-sell tradeable coins to USDT (INJ, NEAR, S, and anything above min notional).');
-  console.log('  3. Withdraw USDT on', USDT_NETWORK, 'to the 0x address.');
+  console.log('  2. Keep NEAR. Market-sell other tradeable coins to USDT (INJ, S, ...).');
+  console.log('  3. Withdraw NEAR on NEAR network to the NEAR address.');
+  console.log('  4. Withdraw USDT on', USDT_NETWORK, 'to the 0x address.');
   console.log('     If using BSC, add BNB Smart Chain in MetaMask before you withdraw.');
-  console.log('  4. Dust (under ~$5) usually cannot be sold or withdrawn.\n');
+  console.log('  5. Dust (under ~$5) usually cannot be sold or withdrawn.\n');
 
   const earn = rows.filter((r) => r.asset.startsWith(LD_PREFIX));
   const spot = rows.filter((r) => !r.asset.startsWith(LD_PREFIX));
@@ -292,9 +299,8 @@ async function getExchangeFilters(symbol) {
 }
 
 async function sellToUsdt(balances, prices) {
-  const skip = new Set(['USDT']);
   const candidates = balances
-    .filter((b) => !b.asset.startsWith(LD_PREFIX) && !skip.has(b.asset) && b.free > 0)
+    .filter((b) => !b.asset.startsWith(LD_PREFIX) && !KEEP_NATIVE.has(b.asset) && b.free > 0)
     .map((b) => {
       const symbol = `${b.asset}USDT`;
       const price = usdPrice(b.asset, prices);
@@ -339,27 +345,34 @@ async function sellToUsdt(balances, prices) {
   }
 }
 
-async function withdrawUsdt() {
+function pickNetwork(networks, wanted) {
+  const want = String(wanted).toUpperCase();
+  return networks.find((n) => {
+    const net = String(n.network || '').toUpperCase();
+    const name = String(n.name || '').toUpperCase();
+    if (net === want) return true;
+    if (want === 'BSC') return net === 'BSC' || name.includes('BEP20') || name.includes('BNB SMART CHAIN');
+    if (want === 'ETH') return net === 'ETH' || net === 'ERC20' || name.includes('ERC20') || name.includes('ETHEREUM');
+    if (want === 'NEAR') return net === 'NEAR' || name.includes('NEAR');
+    return false;
+  });
+}
+
+async function withdrawCoin({ coin, address, networkHint }) {
   const [balances, coinConfig] = await Promise.all([
     getAccountBalances(),
     signedRequest('GET', '/sapi/v1/capital/config/getall'),
   ]);
-  const usdt = balances.find((b) => b.asset === 'USDT');
-  const free = usdt ? usdt.free : 0;
-  const coin = (coinConfig || []).find((c) => c.coin === 'USDT');
-  const networks = (coin && coin.networkList) || [];
-  const net = networks.find(
-    (n) =>
-      n.network === USDT_NETWORK ||
-      n.network === `USDT${USDT_NETWORK}` ||
-      (USDT_NETWORK === 'BSC' && (n.network === 'BSC' || n.name === 'BNB Smart Chain (BEP20)')) ||
-      (USDT_NETWORK === 'ETH' && (n.network === 'ETH' || n.network === 'ERC20'))
-  );
+  const bal = balances.find((b) => b.asset === coin);
+  const free = bal ? bal.free : 0;
+  const cfg = (coinConfig || []).find((c) => c.coin === coin);
+  const networks = (cfg && cfg.networkList) || [];
+  const net = pickNetwork(networks, networkHint);
 
-  console.log('\nUSDT free balance:', formatAmount(free));
-  console.log('Requested network:', USDT_NETWORK);
+  console.log(`\n${coin} free balance:`, formatAmount(free));
+  console.log('Requested network:', networkHint);
   if (networks.length) {
-    console.log('Available USDT networks:');
+    console.log(`Available ${coin} networks:`);
     for (const n of networks) {
       if (!n.withdrawEnable) continue;
       console.log(
@@ -369,39 +382,49 @@ async function withdrawUsdt() {
   }
 
   if (!net) {
-    throw new Error(`USDT network ${USDT_NETWORK} not found on this account. Pick one from the list.`);
+    throw new Error(`${coin} network ${networkHint} not found on this account. Pick one from the list.`);
   }
   if (!net.withdrawEnable) {
-    throw new Error(`USDT withdrawals disabled on ${net.network}`);
+    throw new Error(`${coin} withdrawals disabled on ${net.network}`);
   }
 
   const fee = Number(net.withdrawFee || 0);
   const min = Number(net.withdrawMin || 0);
   const amount = Math.max(0, free - fee);
   console.log(
-    `\nPlan: withdraw ${formatAmount(amount)} USDT on ${net.network} (fee ${fee}, min ${min})`
+    `\nPlan: withdraw ${formatAmount(amount)} ${coin} on ${net.network} (fee ${fee}, min ${min})`
   );
-  console.log('To:', WITHDRAW_ADDRESS);
+  console.log('To:', address);
 
   if (amount < min || amount <= 0) {
-    throw new Error(
-      `USDT amount ${formatAmount(free)} is below min/fee for ${net.network} (min ${min}, fee ${fee}).`
+    console.log(
+      `Skip ${coin}: ${formatAmount(free)} is below min/fee for ${net.network} (min ${min}, fee ${fee}).`
     );
+    return;
   }
 
   if (!FLAG_CONFIRM) {
-    console.log('Withdraw not sent (dry-run). Re-run with --withdraw --confirm');
+    console.log(`Withdraw not sent (dry-run). Re-run with --withdraw --confirm`);
     return;
   }
 
   const result = await signedRequest('POST', '/sapi/v1/capital/withdraw/apply', {
-    coin: 'USDT',
-    address: WITHDRAW_ADDRESS,
+    coin,
+    address,
     amount: String(amount),
     network: net.network,
     walletType: 0,
   });
   console.log('Withdraw submitted:', JSON.stringify(result));
+}
+
+async function withdrawAssets() {
+  if (!/^[0-9a-f]{64}$/i.test(NEAR_ADDRESS)) {
+    throw new Error('NEAR_ADDRESS must be a 64-character hex implicit account (no 0x prefix).');
+  }
+
+  await withdrawCoin({ coin: 'NEAR', address: NEAR_ADDRESS, networkHint: NEAR_NETWORK });
+  await withdrawCoin({ coin: 'USDT', address: EVM_ADDRESS, networkHint: USDT_NETWORK });
 }
 
 function requireKeys() {
@@ -431,7 +454,8 @@ async function main() {
 
   if (FLAG_CONFIRM) {
     console.log('\n*** LIVE MODE: actions will be sent to Binance ***');
-    console.log('Address:', WITHDRAW_ADDRESS);
+    console.log('NEAR address:', NEAR_ADDRESS);
+    console.log('EVM address:', EVM_ADDRESS);
     console.log('USDT network:', USDT_NETWORK);
     await sleep(3000);
   } else {
@@ -456,7 +480,7 @@ async function main() {
   }
 
   if (FLAG_WITHDRAW) {
-    await withdrawUsdt();
+    await withdrawAssets();
   }
 }
 
