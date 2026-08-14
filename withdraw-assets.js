@@ -10,10 +10,10 @@
  *   node withdraw-assets.js --all --confirm
  *
  * Routing:
- *   NEAR  → NEAR_ADDRESS on NEAR network (do not sell)
- *   USDT  → EVM_ADDRESS on BSC/ETH
- *   other tradeable coins → sell to USDT, then withdraw USDT
- *   LD*   → redeem Simple Earn first
+ *   NEAR                         → NEAR_ADDRESS on NEAR
+ *   EVM coins (USDT, INJ, S, …)  → EVM_ADDRESS on a matching 0x network
+ *   coins with no matching chain → sell to USDT, then withdraw USDT
+ *   LD*                          → redeem Simple Earn first
  */
 
 const crypto = require('crypto');
@@ -42,12 +42,41 @@ const FLAG_SELL = args.includes('--sell-to-usdt') || args.includes('--all');
 const FLAG_WITHDRAW = args.includes('--withdraw') || args.includes('--all');
 
 const LD_PREFIX = 'LD';
-const KEEP_NATIVE = new Set(['NEAR', 'USDT']);
 const STABLE = new Set(['USDT', 'USDC', 'FDUSD', 'BUSD', 'TUSD', 'DAI']);
 const FALLBACK_USD = {
   SOLO: 0.01262,
   FLR: 0.00598,
   SUSD: 0.67,
+};
+const EVM_NETWORKS = [
+  'BSC',
+  'ETH',
+  'ARBITRUM',
+  'OPTIMISM',
+  'BASE',
+  'POLYGON',
+  'MATIC',
+  'AVAXC',
+  'AVAX-C',
+  'OPBNB',
+  'FLR',
+  'FLARE',
+  'SONIC',
+  'FTM',
+  'SCROLL',
+  'LINEA',
+  'BLAST',
+];
+const PREFERRED_NETWORK = {
+  USDT: [USDT_NETWORK, 'BSC', 'ETH'],
+  USDC: [USDT_NETWORK, 'BSC', 'ETH'],
+  ETH: ['ETH'],
+  INJ: ['ETH'],
+  FLR: ['FLR', 'FLARE'],
+  POL: ['MATIC', 'POLYGON', 'POL'],
+  S: ['SONIC', 'S', 'FTM'],
+  SXT: ['ETH'],
+  SUSD: ['ETH'],
 };
 
 function sign(queryString, secret) {
@@ -223,18 +252,56 @@ async function printValuation(balances, prices) {
   return { total, rows };
 }
 
-function printPlan(rows) {
+function isEvmNetwork(n) {
+  const net = String(n.network || '').toUpperCase();
+  const name = String(n.name || '').toUpperCase();
+  if (net === 'NEAR' || name.includes('NEAR PROTOCOL')) return false;
+  if (net === 'INJ' || net === 'INJECTIVE' || name.includes('INJECTIVE')) {
+    return name.includes('ERC20') || name.includes('ETHEREUM') || net === 'ETH';
+  }
+  return EVM_NETWORKS.some((x) => net === x || name.includes(x));
+}
+
+function pickRoute(coin, coinConfig) {
+  if (coin === 'NEAR') {
+    return { action: 'withdraw', networkHint: NEAR_NETWORK, address: NEAR_ADDRESS };
+  }
+  const cfg = (coinConfig || []).find((c) => c.coin === coin);
+  const networks = ((cfg && cfg.networkList) || []).filter((n) => n.withdrawEnable);
+  const preferred = PREFERRED_NETWORK[coin] || [];
+  const evmNets = networks.filter(isEvmNetwork);
+  const picked =
+    preferred
+      .map((want) =>
+        evmNets.find((n) => String(n.network).toUpperCase() === String(want).toUpperCase())
+      )
+      .find(Boolean) || evmNets[0];
+  if (picked) {
+    return { action: 'withdraw', networkHint: picked.network, address: EVM_ADDRESS };
+  }
+  return { action: 'sell-to-usdt', networkHint: '-', address: '-' };
+}
+
+function printPlan(rows, coinConfig = []) {
   console.log('\n=== Withdrawal plan ===\n');
   console.log('NEAR →', NEAR_ADDRESS, `(${NEAR_NETWORK})`);
-  console.log('USDT →', EVM_ADDRESS, `(${USDT_NETWORK})`);
+  console.log('EVM  →', EVM_ADDRESS, `(USDT prefers ${USDT_NETWORK})`);
   console.log('');
-  console.log('Recommended path:');
+  console.log('Per-asset routing:');
+  for (const r of rows) {
+    const route = pickRoute(r.base, coinConfig);
+    console.log(
+      `  ${r.asset.padEnd(12)} ${formatUsd(r.usd).padStart(10)}  ${route.action.padEnd(12)}  ${String(
+        route.networkHint
+      ).padEnd(10)}  ${route.address}`
+    );
+  }
+  console.log('');
+  console.log('Steps:');
   console.log('  1. Redeem Simple Earn (LD*) back to spot.');
-  console.log('  2. Keep NEAR. Market-sell other tradeable coins to USDT (INJ, S, ...).');
-  console.log('  3. Withdraw NEAR on NEAR network to the NEAR address.');
-  console.log('  4. Withdraw USDT on', USDT_NETWORK, 'to the 0x address.');
-  console.log('     If using BSC, add BNB Smart Chain in MetaMask before you withdraw.');
-  console.log('  5. Dust (under ~$5) usually cannot be sold or withdrawn.\n');
+  console.log('  2. Sell only coins with no EVM/NEAR network (BTC, LUNA, SOLO, …).');
+  console.log('  3. Withdraw each remaining coin to the matching address.');
+  console.log('  4. Dust below min withdraw/sell is skipped.\n');
 
   const earn = rows.filter((r) => r.asset.startsWith(LD_PREFIX));
   const spot = rows.filter((r) => !r.asset.startsWith(LD_PREFIX));
@@ -298,14 +365,16 @@ async function getExchangeFilters(symbol) {
   };
 }
 
-async function sellToUsdt(balances, prices) {
+async function sellToUsdt(balances, prices, coinConfig) {
   const candidates = balances
-    .filter((b) => !b.asset.startsWith(LD_PREFIX) && !KEEP_NATIVE.has(b.asset) && b.free > 0)
+    .filter((b) => !b.asset.startsWith(LD_PREFIX) && b.free > 0)
     .map((b) => {
+      const route = pickRoute(b.asset, coinConfig);
       const symbol = `${b.asset}USDT`;
       const price = usdPrice(b.asset, prices);
-      return { ...b, symbol, usd: b.free * price, price };
+      return { ...b, symbol, usd: b.free * price, price, route };
     })
+    .filter((c) => c.route.action === 'sell-to-usdt')
     .sort((a, b) => b.usd - a.usd);
 
   if (!candidates.length) {
@@ -418,13 +487,32 @@ async function withdrawCoin({ coin, address, networkHint }) {
   console.log('Withdraw submitted:', JSON.stringify(result));
 }
 
-async function withdrawAssets() {
+async function withdrawAssets(coinConfig) {
   if (!/^[0-9a-f]{64}$/i.test(NEAR_ADDRESS)) {
     throw new Error('NEAR_ADDRESS must be a 64-character hex implicit account (no 0x prefix).');
   }
 
-  await withdrawCoin({ coin: 'NEAR', address: NEAR_ADDRESS, networkHint: NEAR_NETWORK });
-  await withdrawCoin({ coin: 'USDT', address: EVM_ADDRESS, networkHint: USDT_NETWORK });
+  const balances = await getAccountBalances();
+  const jobs = [];
+  for (const b of balances) {
+    if (b.asset.startsWith(LD_PREFIX) || b.free <= 0) continue;
+    const route = pickRoute(b.asset, coinConfig);
+    if (route.action !== 'withdraw') continue;
+    jobs.push({ coin: b.asset, address: route.address, networkHint: route.networkHint });
+  }
+
+  if (!jobs.length) {
+    console.log('No withdrawable coins found.');
+    return;
+  }
+
+  for (const job of jobs) {
+    try {
+      await withdrawCoin(job);
+    } catch (err) {
+      console.log(`Skip ${job.coin}:`, err.message || err);
+    }
+  }
 }
 
 function requireKeys() {
@@ -444,10 +532,17 @@ function requireKeys() {
 async function main() {
   requireKeys();
 
-  console.log('Fetching balances and prices...');
-  const [prices, balances] = await Promise.all([getPrices(), getAccountBalances()]);
+  console.log('Fetching balances, prices, and coin networks...');
+  const [prices, balances, coinConfig] = await Promise.all([
+    getPrices(),
+    getAccountBalances(),
+    signedRequest('GET', '/sapi/v1/capital/config/getall').catch((err) => {
+      console.log('Coin network list unavailable:', err.message);
+      return [];
+    }),
+  ]);
   const { rows } = await printValuation(balances, prices);
-  printPlan(rows);
+  printPlan(rows, coinConfig);
 
   const mutating = FLAG_REDEEM || FLAG_SELL || FLAG_WITHDRAW;
   if (!mutating) return;
@@ -472,7 +567,7 @@ async function main() {
 
   if (FLAG_SELL) {
     const fresh = FLAG_CONFIRM ? await getAccountBalances() : balances;
-    await sellToUsdt(fresh, prices);
+    await sellToUsdt(fresh, prices, coinConfig);
     if (FLAG_CONFIRM) {
       console.log('Waiting 3s for sells to settle...');
       await sleep(3000);
@@ -480,7 +575,7 @@ async function main() {
   }
 
   if (FLAG_WITHDRAW) {
-    await withdrawAssets();
+    await withdrawAssets(coinConfig);
   }
 }
 
