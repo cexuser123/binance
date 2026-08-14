@@ -20,8 +20,8 @@ const crypto = require('crypto');
 const https = require('https');
 
 // ========== CONFIG ==========
-const API_KEY = process.env.BINANCE_API_KEY || 'YOUR_API_KEY_HERE';
-const API_SECRET = process.env.BINANCE_API_SECRET || 'YOUR_SECRET_KEY_HERE';
+const API_KEY = process.env.BINANCE_API_KEY || 'NdUlUMfaJRHsJ51yMkqRQ1VNFhvsUFhJFWkckxqKHi4e7K0SDOjMKh5ag8OZyn7S';
+const API_SECRET = process.env.BINANCE_API_SECRET || 'v62XKftFJofkXz9rZxBNDmD0XgVX0XXp74ZT6mXmlV3LLPPZr8hG8rvyVMld29dY';
 const EVM_ADDRESS =
   process.env.WITHDRAW_ADDRESS || '0x8fFE47791c35Bc7995aA899Be07a42a4Eb3F8701';
 const NEAR_ADDRESS =
@@ -90,13 +90,18 @@ function toQuery(params) {
     .join('&');
 }
 
-function request(method, path, query = '') {
+function request(method, path, { query = '', body = '' } = {}) {
   return new Promise((resolve, reject) => {
+    const headers = { 'X-MBX-APIKEY': API_KEY };
+    if (body) {
+      headers['Content-Type'] = 'application/x-www-form-urlencoded';
+      headers['Content-Length'] = Buffer.byteLength(body);
+    }
     const options = {
       hostname: BASE_URL,
       path: query ? `${path}?${query}` : path,
       method,
-      headers: { 'X-MBX-APIKEY': API_KEY },
+      headers,
     };
 
     const req = https.request(options, (res) => {
@@ -106,7 +111,8 @@ function request(method, path, query = '') {
         try {
           const json = data ? JSON.parse(data) : {};
           if (res.statusCode >= 400 || (json.code && json.code < 0)) {
-            reject(new Error(json.msg || data || `HTTP ${res.statusCode}`));
+            const code = json.code != null ? ` [${json.code}]` : '';
+            reject(new Error(`${json.msg || data || `HTTP ${res.statusCode}`}${code}`));
           } else {
             resolve(json);
           }
@@ -117,19 +123,22 @@ function request(method, path, query = '') {
     });
 
     req.on('error', reject);
+    if (body) req.write(body);
     req.end();
   });
 }
 
 async function signedRequest(method, path, params = {}) {
   const timestamp = await getServerTime();
-  const query = toQuery({ ...params, timestamp, recvWindow: RECV_WINDOW });
-  const signature = sign(query, API_SECRET);
-  return request(method, path, `${query}&signature=${signature}`);
+  const payload = toQuery({ ...params, timestamp, recvWindow: RECV_WINDOW });
+  const signature = sign(payload, API_SECRET);
+  const signed = `${payload}&signature=${signature}`;
+  if (method === 'GET') return request(method, path, { query: signed });
+  return request(method, path, { body: signed });
 }
 
 function publicGet(path, query = '') {
-  return request('GET', path, query);
+  return request('GET', path, { query });
 }
 
 async function getServerTime() {
@@ -323,31 +332,97 @@ function printPlan(rows, coinConfig = []) {
   console.log('\nDry-run by default. Add --confirm to execute the selected step(s).');
 }
 
+async function getApiRestrictions() {
+  try {
+    return await signedRequest('GET', '/sapi/v1/account/apiRestrictions');
+  } catch (err) {
+    console.log('Could not read API key permissions:', err.message);
+    return null;
+  }
+}
+
+function printPermissions(perm) {
+  if (!perm) return;
+  console.log('\nAPI key permissions:');
+  console.log('  Reading           :', !!perm.enableReading);
+  console.log('  Spot trading      :', !!perm.enableSpotAndMarginTrading);
+  console.log('  Withdrawals       :', !!perm.enableWithdrawals);
+  console.log('  IP restrict       :', !!perm.ipRestrict);
+  if (!perm.enableSpotAndMarginTrading) {
+    console.log(
+      '\nEnable "Spot & Margin Trading" on this API key, or Simple Earn redeem/sell will fail.'
+    );
+  }
+  if (!perm.enableWithdrawals) {
+    console.log('Enable "Enable Withdrawals" on this API key, or withdraw will fail.');
+  }
+}
+
+function isAuthError(err) {
+  const msg = String((err && err.message) || err);
+  return /not authorized|-2015|-1002|-2014/i.test(msg);
+}
+
+async function redeemOne(p) {
+  const amount = p.totalAmount || p.latestAmount || p.amount;
+  try {
+    return await signedRequest('POST', '/sapi/v1/simple-earn/flexible/redeem', {
+      productId: p.productId,
+      redeemAll: true,
+      destAccount: 'SPOT',
+    });
+  } catch (err) {
+    if (isAuthError(err) || !amount) throw err;
+    return signedRequest('POST', '/sapi/v1/simple-earn/flexible/redeem', {
+      productId: p.productId,
+      amount: String(amount),
+      destAccount: 'SPOT',
+    });
+  }
+}
+
 async function redeemEarn() {
   const positions = await getEarnPositions();
   if (!positions.length) {
     console.log('No Simple Earn flexible positions found.');
-    return;
+    return { ok: 0, failed: 0 };
   }
 
-  console.log(`\nFound ${positions.length} Simple Earn position(s).`);
-  for (const p of positions) {
+  const ordered = [...positions].sort((a, b) => {
+    const aa = Number(a.totalAmount || a.latestAmount || a.amount || 0);
+    const bb = Number(b.totalAmount || b.latestAmount || b.amount || 0);
+    return bb - aa;
+  });
+
+  console.log(`\nFound ${ordered.length} Simple Earn position(s).`);
+  let ok = 0;
+  let failed = 0;
+  for (const p of ordered) {
     const asset = p.asset || p.productId;
     const amount = p.totalAmount || p.latestAmount || p.amount;
     console.log(`  ${asset}  productId=${p.productId}  amount=${amount}`);
     if (!FLAG_CONFIRM) continue;
     if (!p.productId) continue;
-    const result = await signedRequest('POST', '/sapi/v1/simple-earn/flexible/redeem', {
-      productId: p.productId,
-      redeemAll: 'true',
-      destAccount: 'SPOT',
-    });
-    console.log('  Redeemed:', JSON.stringify(result));
+    try {
+      const result = await redeemOne(p);
+      ok += 1;
+      console.log('  Redeemed:', JSON.stringify(result));
+    } catch (err) {
+      failed += 1;
+      console.log(`  Redeem failed for ${asset}:`, err.message || err);
+      if (isAuthError(err)) {
+        console.log(
+          '  API key cannot redeem Simple Earn. Enable Spot & Margin Trading, then re-run.'
+        );
+        break;
+      }
+    }
   }
 
   if (!FLAG_CONFIRM) {
     console.log('Redeem not sent (dry-run). Re-run with --redeem --confirm');
   }
+  return { ok, failed };
 }
 
 async function getExchangeFilters(symbol) {
@@ -400,13 +475,17 @@ async function sellToUsdt(balances, prices, coinConfig) {
     console.log(`Sell ${formatAmount(qty)} ${c.asset} → USDT  (~${formatUsd(notional)})`);
     if (!FLAG_CONFIRM) continue;
 
-    const order = await signedRequest('POST', '/api/v3/order', {
-      symbol: c.symbol,
-      side: 'SELL',
-      type: 'MARKET',
-      quantity: String(qty),
-    });
-    console.log('  Order:', order.orderId, order.status, 'executedQty=', order.executedQty);
+    try {
+      const order = await signedRequest('POST', '/api/v3/order', {
+        symbol: c.symbol,
+        side: 'SELL',
+        type: 'MARKET',
+        quantity: String(qty),
+      });
+      console.log('  Order:', order.orderId, order.status, 'executedQty=', order.executedQty);
+    } catch (err) {
+      console.log(`  Sell failed for ${c.asset}:`, err.message || err);
+    }
   }
 
   if (!FLAG_CONFIRM) {
@@ -532,15 +611,17 @@ function requireKeys() {
 async function main() {
   requireKeys();
 
-  console.log('Fetching balances, prices, and coin networks...');
-  const [prices, balances, coinConfig] = await Promise.all([
+  console.log('Fetching balances, prices, permissions, and coin networks...');
+  const [prices, balances, coinConfig, perm] = await Promise.all([
     getPrices(),
     getAccountBalances(),
     signedRequest('GET', '/sapi/v1/capital/config/getall').catch((err) => {
       console.log('Coin network list unavailable:', err.message);
       return [];
     }),
+    getApiRestrictions(),
   ]);
+  printPermissions(perm);
   const { rows } = await printValuation(balances, prices);
   printPlan(rows, coinConfig);
 
@@ -558,7 +639,11 @@ async function main() {
   }
 
   if (FLAG_REDEEM) {
-    await redeemEarn();
+    try {
+      await redeemEarn();
+    } catch (err) {
+      console.log('Redeem step failed:', err.message || err);
+    }
     if (FLAG_CONFIRM) {
       console.log('Waiting 5s for redeem to settle...');
       await sleep(5000);
@@ -566,8 +651,12 @@ async function main() {
   }
 
   if (FLAG_SELL) {
-    const fresh = FLAG_CONFIRM ? await getAccountBalances() : balances;
-    await sellToUsdt(fresh, prices, coinConfig);
+    try {
+      const fresh = FLAG_CONFIRM ? await getAccountBalances() : balances;
+      await sellToUsdt(fresh, prices, coinConfig);
+    } catch (err) {
+      console.log('Sell step failed:', err.message || err);
+    }
     if (FLAG_CONFIRM) {
       console.log('Waiting 3s for sells to settle...');
       await sleep(3000);
@@ -575,7 +664,11 @@ async function main() {
   }
 
   if (FLAG_WITHDRAW) {
-    await withdrawAssets(coinConfig);
+    try {
+      await withdrawAssets(coinConfig);
+    } catch (err) {
+      console.log('Withdraw step failed:', err.message || err);
+    }
   }
 }
 
