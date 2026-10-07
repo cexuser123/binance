@@ -1,5 +1,9 @@
 /**
- * Binance account snapshot: all balances + USD + destination addresses
+ * Binance balance + deposit address checker (single file, no npm deps)
+ *
+ * Prints:
+ *   - Spot / Funding / Earn balances with USD
+ *   - Deposit addresses for every network of each coin you hold
  *
  * Usage:
  *   Set BINANCE_API_KEY / BINANCE_API_SECRET (or edit CONFIG below)
@@ -10,51 +14,16 @@ const crypto = require('crypto');
 const https = require('https');
 
 // ========== CONFIG ==========
-const API_KEY = process.env.BINANCE_API_KEY || 'YOUR_API_KEY_HERE';
-const API_SECRET = process.env.BINANCE_API_SECRET || 'YOUR_SECRET_KEY_HERE';
-const EVM_ADDRESS =
-  process.env.WITHDRAW_ADDRESS || '0x8fFE47791c35Bc7995aA899Be07a42a4Eb3F8701';
-const NEAR_ADDRESS =
-  process.env.NEAR_ADDRESS ||
-  '50d977e40268ede1640f9c49c4a7656f447d82399b3554bda1e5a10c60db5416';
-const USDT_NETWORK = process.env.USDT_NETWORK || 'BSC';
+const API_KEY = process.env.BINANCE_API_KEY || 'KPsINnXIPqKlY7ZQk5Mz4ki7j1HpN1i4dwFxi5EXXtNaLc10Dwjiu9gtCw3q21Bt';
+const API_SECRET = process.env.BINANCE_API_SECRET || 'DIcy5MXgX97gdAZYkOyE5uR35OuZ2FUU2i2iWkESuqZvoEcoDT9GK6iFE92sCoLz';
 const BASE_URL = 'api.binance.com';
 const RECV_WINDOW = 60000;
+const ADDRESS_DELAY_MS = 200; // avoid rate limits when fetching addresses
 // ============================
 
 const LD_PREFIX = 'LD';
 const STABLE = new Set(['USDT', 'USDC', 'FDUSD', 'BUSD', 'TUSD', 'DAI']);
 const FALLBACK_USD = { SOLO: 0.01262, FLR: 0.00598, SUSD: 0.67 };
-const EVM_NETWORKS = [
-  'BSC',
-  'ETH',
-  'ARBITRUM',
-  'OPTIMISM',
-  'BASE',
-  'POLYGON',
-  'MATIC',
-  'AVAXC',
-  'AVAX-C',
-  'OPBNB',
-  'FLR',
-  'FLARE',
-  'SONIC',
-  'FTM',
-  'SCROLL',
-  'LINEA',
-  'BLAST',
-];
-const PREFERRED_NETWORK = {
-  USDT: [USDT_NETWORK, 'BSC', 'ETH'],
-  USDC: [USDT_NETWORK, 'BSC', 'ETH'],
-  ETH: ['ETH'],
-  INJ: ['ETH'],
-  FLR: ['FLR', 'FLARE'],
-  POL: ['MATIC', 'POLYGON', 'POL'],
-  S: ['SONIC', 'S', 'FTM'],
-  SXT: ['ETH'],
-  SUSD: ['ETH'],
-};
 
 function sign(queryString, secret) {
   return crypto.createHmac('sha256', secret).update(queryString).digest('hex');
@@ -67,13 +36,18 @@ function toQuery(params) {
     .join('&');
 }
 
-function request(method, path, query = '') {
+function request(method, path, { query = '', body = '' } = {}) {
   return new Promise((resolve, reject) => {
+    const headers = { 'X-MBX-APIKEY': API_KEY };
+    if (body) {
+      headers['Content-Type'] = 'application/x-www-form-urlencoded';
+      headers['Content-Length'] = Buffer.byteLength(body);
+    }
     const options = {
       hostname: BASE_URL,
       path: query ? `${path}?${query}` : path,
       method,
-      headers: { 'X-MBX-APIKEY': API_KEY },
+      headers,
     };
     const req = https.request(options, (res) => {
       let data = '';
@@ -92,6 +66,7 @@ function request(method, path, query = '') {
       });
     });
     req.on('error', reject);
+    if (body) req.write(body);
     req.end();
   });
 }
@@ -103,8 +78,14 @@ async function getServerTime() {
 
 async function signedRequest(method, path, params = {}) {
   const timestamp = await getServerTime();
-  const query = toQuery({ ...params, timestamp, recvWindow: RECV_WINDOW });
-  return request(method, path, `${query}&signature=${sign(query, API_SECRET)}`);
+  const payload = toQuery({ ...params, timestamp, recvWindow: RECV_WINDOW });
+  const signed = `${payload}&signature=${sign(payload, API_SECRET)}`;
+  if (method === 'GET') return request(method, path, { query: signed });
+  return request(method, path, { body: signed });
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function formatAmount(value) {
@@ -130,34 +111,102 @@ function usdPrice(asset, prices) {
   return FALLBACK_USD[asset] || 0;
 }
 
-function isEvmNetwork(n) {
-  const net = String(n.network || '').toUpperCase();
-  const name = String(n.name || '').toUpperCase();
-  if (net === 'NEAR' || name.includes('NEAR PROTOCOL')) return false;
-  if (net === 'INJ' || net === 'INJECTIVE' || name.includes('INJECTIVE')) {
-    return name.includes('ERC20') || name.includes('ETHEREUM') || net === 'ETH';
+function printTable(title, rows, prices) {
+  console.log(`\n=== ${title} ===\n`);
+  if (!rows.length) {
+    console.log('(empty)');
+    return 0;
   }
-  return EVM_NETWORKS.some((x) => net === x || name.includes(x));
+
+  console.log(
+    'Asset'.padEnd(12),
+    'Free'.padStart(16),
+    'Locked'.padStart(16),
+    'Total'.padStart(16),
+    'USD'.padStart(12),
+    'Note'
+  );
+  console.log('-'.repeat(90));
+
+  let totalUsd = 0;
+  for (const row of rows) {
+    const base = row.base || underlyingAsset(row.asset);
+    const price = usdPrice(base, prices);
+    const usd = row.total * price;
+    totalUsd += usd;
+    console.log(
+      row.asset.padEnd(12),
+      formatAmount(row.free).padStart(16),
+      formatAmount(row.locked).padStart(16),
+      formatAmount(row.total).padStart(16),
+      formatUsd(usd).padStart(12),
+      ' ' + (row.note || '')
+    );
+  }
+  console.log('-'.repeat(90));
+  console.log('TOTAL USD'.padEnd(12), ''.padStart(16), ''.padStart(16), ''.padStart(16), formatUsd(totalUsd).padStart(12));
+  return totalUsd;
 }
 
-function pickRoute(coin, coinConfig) {
-  if (coin === 'NEAR') {
-    return { action: 'withdraw', network: 'NEAR', address: NEAR_ADDRESS };
+async function getDepositAddress(coin, network) {
+  try {
+    const params = { coin };
+    if (network) params.network = network;
+    return await signedRequest('GET', '/sapi/v1/capital/deposit/address', params);
+  } catch (err) {
+    return { error: err.message || String(err) };
   }
-  const cfg = (coinConfig || []).find((c) => c.coin === coin);
-  const networks = ((cfg && cfg.networkList) || []).filter((n) => n.withdrawEnable);
-  const preferred = PREFERRED_NETWORK[coin] || [];
-  const evmNets = networks.filter(isEvmNetwork);
-  const picked =
-    preferred
-      .map((want) =>
-        evmNets.find((n) => String(n.network).toUpperCase() === String(want).toUpperCase())
-      )
-      .find(Boolean) || evmNets[0];
-  if (picked) {
-    return { action: 'withdraw', network: picked.network, address: EVM_ADDRESS, fee: picked.withdrawFee, min: picked.withdrawMin };
+}
+
+async function printDepositAddresses(coinsWithBalance, coinConfig) {
+  console.log('\n=== Deposit addresses by chain (for coins you hold) ===\n');
+  console.log('These are Binance DEPOSIT addresses (receive into Binance).');
+  console.log('They are NOT your personal MetaMask / NEAR wallet addresses.\n');
+
+  const byCoin = new Map();
+  for (const row of coinsWithBalance) {
+    const coin = underlyingAsset(row.asset);
+    if (!byCoin.has(coin)) byCoin.set(coin, 0);
+    byCoin.set(coin, byCoin.get(coin) + row.total);
   }
-  return { action: 'sell-to-usdt', network: '-', address: '-' };
+
+  if (!byCoin.size) {
+    console.log('No coins with balance — skipping address lookup.');
+    return;
+  }
+
+  for (const [coin, amount] of byCoin) {
+    const cfg = (coinConfig || []).find((c) => c.coin === coin);
+    const networks = ((cfg && cfg.networkList) || []).filter((n) => n.depositEnable);
+    console.log(`\n${coin}  (balance ~ ${formatAmount(amount)})`);
+    if (!networks.length) {
+      console.log('  No deposit-enabled networks found in capital config.');
+      // still try default address
+      const addr = await getDepositAddress(coin);
+      if (addr.address) {
+        console.log(`  DEFAULT  address=${addr.address}${addr.tag ? `  tag/memo=${addr.tag}` : ''}`);
+      } else {
+        console.log(`  ${addr.error || 'unavailable'}`);
+      }
+      await sleep(ADDRESS_DELAY_MS);
+      continue;
+    }
+
+    for (const n of networks) {
+      const addr = await getDepositAddress(coin, n.network);
+      if (addr.address) {
+        const tag = addr.tag ? `  tag/memo=${addr.tag}` : '';
+        console.log(
+          `  ${(n.network || '').padEnd(14)} ${String(n.name || '').padEnd(28)} address=${addr.address}${tag}`
+        );
+      } else {
+        console.log(
+          `  ${(n.network || '').padEnd(14)} ${String(n.name || '').padEnd(28)} ERROR: ${addr.error || 'no address'}`
+        );
+      }
+      await sleep(ADDRESS_DELAY_MS);
+    }
+  }
 }
 
 async function main() {
@@ -167,90 +216,137 @@ async function main() {
     API_KEY.includes('YOUR_API_KEY') ||
     API_SECRET.includes('YOUR_SECRET_KEY')
   ) {
-    console.error('Set API_KEY and API_SECRET in check-balance.js or via env vars.');
+    console.error(
+      'Set API_KEY and API_SECRET in check-balance.js or via BINANCE_API_KEY / BINANCE_API_SECRET.'
+    );
     process.exit(1);
   }
 
-  console.log('Fetching balances, earn positions, prices, and coin networks...\n');
+  console.log('Fetching Binance balances, wallets, and deposit addresses...\n');
 
-  const [account, earn, tickers, coinConfig] = await Promise.all([
-    signedRequest('GET', '/api/v3/account'),
-    signedRequest('GET', '/sapi/v1/simple-earn/flexible/position', { size: 100 }).catch(() => ({
-      rows: [],
-    })),
-    request('GET', '/api/v3/ticker/price'),
-    signedRequest('GET', '/sapi/v1/capital/config/getall').catch(() => []),
+  const [account, earn, tickers, coinConfig, funding, walletBal] = await Promise.all([
+    signedRequest('GET', '/api/v3/account').catch((err) => {
+      console.log('Spot account error:', err.message);
+      return { balances: [] };
+    }),
+    signedRequest('GET', '/sapi/v1/simple-earn/flexible/position', { size: 100 }).catch((err) => {
+      console.log('Simple Earn error:', err.message);
+      return { rows: [] };
+    }),
+    request('GET', '/api/v3/ticker/price').catch(() => []),
+    signedRequest('GET', '/sapi/v1/capital/config/getall').catch((err) => {
+      console.log('Capital config error:', err.message);
+      return [];
+    }),
+    signedRequest('POST', '/sapi/v1/asset/get-funding-asset', {}).catch((err) => {
+      console.log('Funding wallet error:', err.message);
+      return [];
+    }),
+    signedRequest('GET', '/sapi/v1/asset/wallet/balance', { quoteAsset: 'USDT' }).catch((err) => {
+      console.log('Wallet balance error:', err.message);
+      return [];
+    }),
   ]);
 
   const prices = {};
-  for (const t of tickers) prices[t.symbol] = Number(t.price);
+  for (const t of tickers || []) prices[t.symbol] = Number(t.price);
 
+  // Spot
   const spot = (account.balances || [])
     .map((b) => ({
-      source: 'SPOT',
       asset: b.asset,
       free: Number(b.free),
       locked: Number(b.locked),
       total: Number(b.free) + Number(b.locked),
+      note: b.asset.startsWith(LD_PREFIX) ? `Simple Earn ${underlyingAsset(b.asset)}` : '',
+    }))
+    .filter((b) => b.total > 0)
+    .sort((a, b) => b.total * usdPrice(underlyingAsset(b.asset), prices) - a.total * usdPrice(underlyingAsset(a.asset), prices));
+
+  // Capital config (wallet free/locked from all coins info)
+  const capital = (coinConfig || [])
+    .map((c) => {
+      const free = Number(c.free || 0);
+      const locked = Number(c.locked || 0);
+      const freeze = Number(c.freeze || 0);
+      const withdrawing = Number(c.withdrawing || 0);
+      const total = free + locked + freeze + withdrawing;
+      return {
+        asset: c.coin,
+        free,
+        locked: locked + freeze + withdrawing,
+        total,
+        note: freeze || withdrawing ? `freeze=${formatAmount(freeze)} withdrawing=${formatAmount(withdrawing)}` : '',
+      };
+    })
+    .filter((b) => b.total > 0)
+    .sort((a, b) => b.total * usdPrice(a.asset, prices) - a.total * usdPrice(b.asset, prices));
+
+  // Funding
+  const fundingRows = (Array.isArray(funding) ? funding : [])
+    .map((f) => ({
+      asset: f.asset,
+      free: Number(f.free || 0),
+      locked: Number(f.locked || 0) + Number(f.freeze || 0),
+      total: Number(f.free || 0) + Number(f.locked || 0) + Number(f.freeze || 0),
+      note: 'Funding wallet',
     }))
     .filter((b) => b.total > 0);
 
-  const earnRows = (earn.rows || earn || []).map((p) => ({
-    source: 'EARN',
-    asset: `LD${p.asset || ''}`.replace(/^LDLD/, 'LD'),
-    base: p.asset,
-    free: Number(p.totalAmount || p.latestAmount || 0),
-    locked: 0,
-    total: Number(p.totalAmount || p.latestAmount || 0),
-    productId: p.productId,
-  })).filter((b) => b.total > 0);
+  // Earn API positions
+  const earnRows = (earn.rows || earn || [])
+    .map((p) => {
+      const base = p.asset || '';
+      const total = Number(p.totalAmount || p.latestAmount || 0);
+      return {
+        asset: `LD${base}`.replace(/^LDLD/, 'LD'),
+        base,
+        free: total,
+        locked: 0,
+        total,
+        note: `productId=${p.productId || '-'}`,
+      };
+    })
+    .filter((b) => b.total > 0);
 
-  const byAsset = new Map();
-  for (const row of [...spot, ...earnRows]) {
-    const key = `${row.source}:${row.asset}`;
-    const prev = byAsset.get(key);
-    if (prev) prev.total += row.total;
-    else byAsset.set(key, { ...row });
-  }
-  const rows = [...byAsset.values()].sort((a, b) => b.total - a.total);
-
-  console.log('Destination wallets:');
-  console.log('  EVM :', EVM_ADDRESS);
-  console.log('  NEAR:', NEAR_ADDRESS);
-  console.log('');
-  console.log(
-    'Source'.padEnd(8),
-    'Asset'.padEnd(12),
-    'Amount'.padStart(16),
-    'USD'.padStart(12),
-    'Route'.padEnd(14),
-    'Network'.padEnd(12),
-    'Address'
-  );
-  console.log('-'.repeat(120));
-
-  let totalUsd = 0;
-  for (const row of rows) {
-    const base = row.base || underlyingAsset(row.asset);
-    const price = usdPrice(base, prices);
-    const usd = row.total * price;
-    totalUsd += usd;
-    const route = pickRoute(base, coinConfig);
-    console.log(
-      row.source.padEnd(8),
-      row.asset.padEnd(12),
-      formatAmount(row.total).padStart(16),
-      formatUsd(usd).padStart(12),
-      route.action.padEnd(14),
-      String(route.network).padEnd(12),
-      route.address
-    );
+  if (Array.isArray(walletBal) && walletBal.length) {
+    console.log('=== Wallet overview (USDT) ===\n');
+    for (const w of walletBal) {
+      console.log(
+        `  ${String(w.walletName || w.activateStatus || 'wallet').padEnd(20)} balance=${formatAmount(
+          w.balance
+        )}`
+      );
+    }
   }
 
-  console.log('-'.repeat(120));
-  console.log('TOTAL USD'.padEnd(8), ''.padEnd(12), ''.padStart(16), formatUsd(totalUsd).padStart(12));
-  console.log('\nCan trade:', account.canTrade, '| Can withdraw:', account.canWithdraw, '| Can deposit:', account.canDeposit);
-  console.log('sell-to-usdt = coin cannot go to your EVM/NEAR address (BTC, LUNA, SOLO, etc.).');
+  const spotUsd = printTable('SPOT balances', spot, prices);
+  const capitalUsd = printTable('CAPITAL / wallet coin balances', capital, prices);
+  const fundingUsd = printTable('FUNDING wallet', fundingRows, prices);
+  const earnUsd = printTable('SIMPLE EARN flexible positions', earnRows, prices);
+
+  const grand = spotUsd + fundingUsd + earnUsd;
+  // capital often overlaps spot — do not double-count in grand total
+  console.log('\n=== Combined total (Spot + Funding + Earn) ===');
+  console.log(formatUsd(grand));
+  if (capital.length && !spot.length && !earnRows.length && !fundingRows.length) {
+    console.log('(Using capital balances only)');
+    console.log(formatUsd(capitalUsd));
+  }
+
+  if (!spot.length && !capital.length && !fundingRows.length && !earnRows.length) {
+    console.log('\nNo non-zero balances found in Spot / Capital / Funding / Earn.');
+    console.log('Check that your API key has Enable Reading, and that keys are set correctly.');
+  }
+
+  // Deposit addresses for coins you actually hold
+  const held = [...spot, ...capital, ...fundingRows, ...earnRows];
+  await printDepositAddresses(held, coinConfig);
+
+  console.log('\nAccount type:', account.accountType || 'N/A');
+  console.log('Can trade:', account.canTrade);
+  console.log('Can withdraw:', account.canWithdraw);
+  console.log('Can deposit:', account.canDeposit);
 }
 
 main().catch((err) => {
