@@ -92,7 +92,7 @@ const ROUTES = {
   TRX: { wallet: 'TRX', networks: ['TRX'] },
   BTTC: { wallet: 'TRX', networks: ['TRX', 'BSC'] },
   CKB: { wallet: 'CKB', networks: ['CKB'] },
-  A: { wallet: 'EOS', networks: ['EOS', 'A'] }, // Vaulta
+  A: { wallet: 'EVM', networks: ['BSC', 'EOS', 'A'] }, // Vaulta — prefer BSC if available, else EOS
   SOLO: { wallet: null, networks: [] }, // usually sell
 };
 
@@ -148,12 +148,70 @@ async function getServerTime() {
   return data.serverTime;
 }
 
-async function signedRequest(method, path, params = {}) {
+/**
+ * mode:
+ *   'auto'  - GET uses query; POST uses body
+ *   'query' - put signed params in query string (needed by some Binance POST endpoints)
+ *   'body'  - put signed params in form body
+ */
+async function signedRequest(method, path, params = {}, mode = 'auto') {
   const timestamp = await getServerTime();
   const payload = toQuery({ ...params, timestamp, recvWindow: RECV_WINDOW });
   const signed = `${payload}&signature=${sign(payload, API_SECRET)}`;
-  if (method === 'GET') return request(method, path, { query: signed });
+  if (method === 'GET' || mode === 'query') return request(method, path, { query: signed });
+  if (mode === 'body') return request(method, path, { body: signed });
+  // auto POST: body first
   return request(method, path, { body: signed });
+}
+
+async function signedPost(path, params = {}) {
+  try {
+    return await signedRequest('POST', path, params, 'body');
+  } catch (err) {
+    const msg = String(err.message || err);
+    // Retry with query-string POST (some keys/endpoints reject empty-looking bodies)
+    if (/not authorized|-1002|-1022|-2015|signature/i.test(msg)) {
+      return signedRequest('POST', path, params, 'query');
+    }
+    throw err;
+  }
+}
+
+function isPermissionError(err) {
+  const msg = String((err && err.message) || err);
+  return /not authorized|-1002|-2015|-2014|Invalid API-key|IP, or permissions/i.test(msg);
+}
+
+async function getApiRestrictions() {
+  try {
+    return await signedRequest('GET', '/sapi/v1/account/apiRestrictions');
+  } catch (err) {
+    console.log('Could not read API permissions:', err.message);
+    return null;
+  }
+}
+
+function printPermissions(perm) {
+  if (!perm) return { canTrade: null, canWithdraw: null };
+  const canTrade = !!perm.enableSpotAndMarginTrading;
+  const canWithdraw = !!perm.enableWithdrawals;
+  console.log('\n=== API key permissions ===');
+  console.log('  Reading      :', !!perm.enableReading);
+  console.log('  Spot trading :', canTrade);
+  console.log('  Withdrawals  :', canWithdraw);
+  console.log('  IP restrict  :', !!perm.ipRestrict);
+  if (!canTrade) {
+    console.log('\nFIX: Binance → API Management → edit this key → enable "Enable Spot & Margin Trading"');
+    console.log('     Required for Simple Earn redeem and sell-to-USDT.');
+  }
+  if (!canWithdraw) {
+    console.log('\nFIX: Enable "Enable Withdrawals" and whitelist destination addresses.');
+  }
+  if (perm.ipRestrict) {
+    console.log('NOTE: IP whitelist is ON — your current public IP must be on the key.');
+  }
+  console.log('');
+  return { canTrade, canWithdraw };
 }
 
 function sleep(ms) {
@@ -363,28 +421,60 @@ async function getEarnPositions() {
   }
 }
 
-async function redeemEarn() {
+async function redeemEarn(canTrade) {
   const positions = await getEarnPositions();
   if (!positions.length) {
     console.log('No Simple Earn positions.');
-    return;
+    return { ok: 0, failed: 0, skipped: false };
   }
+
+  if (canTrade === false) {
+    console.log('\nSkip redeem: Spot trading is OFF on this API key.');
+    console.log('Your Earn USDT stays locked until you enable Spot trading OR redeem on the website.');
+    for (const p of positions) {
+      console.log(`  pending: ${p.asset} ${p.totalAmount} productId=${p.productId}`);
+    }
+    return { ok: 0, failed: 0, skipped: true };
+  }
+
   console.log(`\nRedeeming ${positions.length} Earn position(s)...`);
+  let ok = 0;
+  let failed = 0;
   for (const p of positions) {
-    console.log(`  ${p.asset} productId=${p.productId} amount=${p.totalAmount}`);
+    const amount = p.totalAmount || p.latestAmount || p.amount;
+    console.log(`  ${p.asset} productId=${p.productId} amount=${amount}`);
     if (!FLAG_CONFIRM || !p.productId) continue;
     try {
-      const result = await signedRequest('POST', '/sapi/v1/simple-earn/flexible/redeem', {
-        productId: p.productId,
-        redeemAll: true,
-        destAccount: 'SPOT',
-      });
+      let result;
+      try {
+        result = await signedPost('/sapi/v1/simple-earn/flexible/redeem', {
+          productId: p.productId,
+          redeemAll: true,
+          destAccount: 'SPOT',
+        });
+      } catch (err) {
+        if (isPermissionError(err) || !amount) throw err;
+        result = await signedPost('/sapi/v1/simple-earn/flexible/redeem', {
+          productId: p.productId,
+          amount: String(amount),
+          destAccount: 'SPOT',
+        });
+      }
+      ok += 1;
       console.log('  OK:', JSON.stringify(result));
     } catch (err) {
+      failed += 1;
       console.log('  Fail:', err.message);
+      if (isPermissionError(err)) {
+        console.log(
+          '  → Enable "Spot & Margin Trading" on the API key, or redeem USDT Earn manually on Binance website.'
+        );
+        break;
+      }
     }
   }
   if (!FLAG_CONFIRM) console.log('Dry-run. Use --redeem --confirm');
+  return { ok, failed, skipped: false };
 }
 
 async function getExchangeFilters(symbol) {
@@ -402,7 +492,7 @@ async function getExchangeFilters(symbol) {
   };
 }
 
-async function sellToUsdt(balances, prices, coinConfig) {
+async function sellToUsdt(balances, prices, coinConfig, canTrade) {
   const candidates = balances
     .filter((b) => !b.asset.startsWith(LD_PREFIX) && b.free > 0 && b.asset !== 'USDT')
     .map((b) => {
@@ -423,8 +513,19 @@ async function sellToUsdt(balances, prices, coinConfig) {
     return;
   }
 
+  if (canTrade === false) {
+    console.log('\nSkip sell-to-USDT: Spot trading is OFF on this API key.');
+    for (const c of candidates) {
+      console.log(`  left on Binance: ${c.asset} ${formatAmount(c.free)} (~${formatUsd(c.usd)}) — ${c.route.reason}`);
+    }
+    console.log('Enable Spot trading, then re-run: node withdraw-assets.js --sell-to-usdt --confirm');
+    return;
+  }
+
   console.log('\n=== Sell to USDT ===');
+  let permissionBlocked = false;
   for (const c of candidates) {
+    if (permissionBlocked) break;
     const filters = await getExchangeFilters(c.symbol);
     if (!filters || filters.status !== 'TRADING') {
       console.log(`Skip ${c.asset}: no ${c.symbol} market (${formatUsd(c.usd)}) — ${c.route.reason}`);
@@ -439,7 +540,7 @@ async function sellToUsdt(balances, prices, coinConfig) {
     console.log(`Sell ${formatAmount(qty)} ${c.asset} → USDT (~${formatUsd(notional)}) [${c.route.reason}]`);
     if (!FLAG_CONFIRM) continue;
     try {
-      const order = await signedRequest('POST', '/api/v3/order', {
+      const order = await signedPost('/api/v3/order', {
         symbol: c.symbol,
         side: 'SELL',
         type: 'MARKET',
@@ -448,6 +549,10 @@ async function sellToUsdt(balances, prices, coinConfig) {
       console.log('  Order', order.orderId, order.status);
     } catch (err) {
       console.log('  Fail:', err.message);
+      if (isPermissionError(err)) {
+        permissionBlocked = true;
+        console.log('  → Enable "Spot & Margin Trading" (and allow your IP) on this API key.');
+      }
     }
   }
   if (!FLAG_CONFIRM) console.log('Dry-run. Use --sell-to-usdt --confirm');
@@ -484,8 +589,28 @@ async function withdrawCoin(job) {
   };
   if (job.addressTag) params.addressTag = job.addressTag;
 
-  const result = await signedRequest('POST', '/sapi/v1/capital/withdraw/apply', params);
+  const result = await signedPost('/sapi/v1/capital/withdraw/apply', params);
   console.log('Submitted:', JSON.stringify(result));
+}
+
+/**
+ * Main gas / fee coins — withdrawn LAST.
+ * Example order: USDT, USDC, ARB, JUP, BTTC, ADA, XRP … then ETH, BNB, SOL, TRX, BTC.
+ */
+const GAS_COINS = new Set(['ETH', 'BNB', 'SOL', 'TRX', 'BTC', 'MATIC', 'POL', 'AVAX']);
+
+function isGasCoin(coin) {
+  return GAS_COINS.has(String(coin || '').toUpperCase());
+}
+
+function sortWithdrawJobs(jobs) {
+  // 1) all tokens first  2) gas/native coins last
+  return [...jobs].sort((a, b) => {
+    const ag = isGasCoin(a.coin) ? 1 : 0;
+    const bg = isGasCoin(b.coin) ? 1 : 0;
+    if (ag !== bg) return ag - bg;
+    return String(a.coin).localeCompare(String(b.coin));
+  });
 }
 
 async function withdrawAssets(balances, coinConfig) {
@@ -500,10 +625,30 @@ async function withdrawAssets(balances, coinConfig) {
     console.log('\nNo withdraw jobs (missing addresses or all marked sell).');
     return;
   }
-  console.log(`\n=== Withdraw ${jobs.length} coin(s) ===`);
-  for (const job of jobs) {
+
+  const ordered = sortWithdrawJobs(jobs);
+  const tokens = ordered.filter((j) => !isGasCoin(j.coin));
+  const gas = ordered.filter((j) => isGasCoin(j.coin));
+
+  console.log(`\n=== Withdraw order: ${tokens.length} token(s) first, then ${gas.length} gas coin(s) ===`);
+  console.log('Phase 1 (tokens):', tokens.map((j) => j.coin).join(', ') || '(none)');
+  console.log('Phase 2 (gas)   :', gas.map((j) => j.coin).join(', ') || '(none)');
+
+  console.log('\n--- Phase 1: tokens ---');
+  for (const job of tokens) {
     try {
       await withdrawCoin(job);
+      if (FLAG_CONFIRM) await sleep(1500);
+    } catch (err) {
+      console.log(`Skip ${job.coin}:`, err.message);
+    }
+  }
+
+  console.log('\n--- Phase 2: gas / native fee coins ---');
+  for (const job of gas) {
+    try {
+      await withdrawCoin(job);
+      if (FLAG_CONFIRM) await sleep(1500);
     } catch (err) {
       console.log(`Skip ${job.coin}:`, err.message);
     }
@@ -526,24 +671,27 @@ async function main() {
   requireKeys();
   printNeededAddresses();
 
-  console.log('Fetching balances, prices, networks...');
-  const [prices, balances, coinConfig] = await Promise.all([
+  console.log('Fetching balances, prices, networks, permissions...');
+  const [prices, balances, coinConfig, perm] = await Promise.all([
     getPrices(),
     getAccountBalances(),
     signedRequest('GET', '/sapi/v1/capital/config/getall').catch((err) => {
       console.log('capital/config error:', err.message);
       return [];
     }),
+    getApiRestrictions(),
   ]);
+  const { canTrade, canWithdraw } = printPermissions(perm);
 
   await printPlan(balances, prices, coinConfig);
 
   const mutating = FLAG_REDEEM || FLAG_SELL || FLAG_WITHDRAW;
   if (!mutating) {
     console.log('\nDry-run only. Next steps:');
-    console.log('  1. Fill DEST.SOL and DEST.TRX (and keep DEST.EVM).');
-    console.log('  2. Whitelist those addresses on Binance API key.');
+    console.log('  1. Enable Spot & Margin Trading on the API key (for Earn redeem + sells).');
+    console.log('  2. Enable Withdrawals + whitelist EVM/SOL/TRX/BTC/ADA/XRP addresses.');
     console.log('  3. node withdraw-assets.js --all --confirm');
+    console.log('  Or withdraw spot only: node withdraw-assets.js --withdraw --confirm');
     return;
   }
 
@@ -552,20 +700,26 @@ async function main() {
     console.log('EVM:', DEST.EVM || '(empty)');
     console.log('SOL:', DEST.SOL || '(empty)');
     console.log('TRX:', DEST.TRX || '(empty)');
+    console.log('BTC:', DEST.BTC || '(empty)');
+    console.log('ADA:', DEST.ADA || '(empty)');
+    console.log('XRP:', DEST.XRP || '(empty)');
+    if (canWithdraw === false) {
+      console.log('\nWARNING: Withdrawals are disabled on this API key. Withdraw calls will fail.');
+    }
     await sleep(3000);
   } else {
     console.log('\n*** DRY RUN (add --confirm to execute) ***');
   }
 
   if (FLAG_REDEEM) {
-    await redeemEarn();
-    if (FLAG_CONFIRM) await sleep(5000);
+    await redeemEarn(canTrade);
+    if (FLAG_CONFIRM && canTrade !== false) await sleep(5000);
   }
 
   if (FLAG_SELL) {
     const fresh = FLAG_CONFIRM ? await getAccountBalances() : balances;
-    await sellToUsdt(fresh, prices, coinConfig);
-    if (FLAG_CONFIRM) await sleep(3000);
+    await sellToUsdt(fresh, prices, coinConfig, canTrade);
+    if (FLAG_CONFIRM && canTrade !== false) await sleep(3000);
   }
 
   if (FLAG_WITHDRAW) {
