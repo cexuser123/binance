@@ -7,6 +7,8 @@
  *   node withdraw-assets.js --all --confirm # redeem? + sell orphans + withdraw
  *   node withdraw-assets.js --sell-to-usdt --confirm
  *   node withdraw-assets.js --withdraw --confirm
+ *   node withdraw-assets.js --watch         # check balances every 1 min (no send)
+ *   node withdraw-assets.js --watch --confirm  # auto-withdraw USDT when >= threshold
  *
  * IMPORTANT:
  *   The addresses in check-balance.js are Binance DEPOSIT addresses.
@@ -17,8 +19,8 @@ const crypto = require('crypto');
 const https = require('https');
 
 // ========== CONFIG ==========
-const API_KEY = process.env.BINANCE_API_KEY || 'dDpLI8Lf1fXLMTv5y1swZT0zJeQsI0oNiiu1d8UBmYVIh4BhETDHQzg55PigZZzl';
-const API_SECRET = process.env.BINANCE_API_SECRET || 'fqt6gxjwSIjyaLFmMs7syJnbpCAqJe5bpsbGAdGF4juR7aBAAbhppCI3SeF6dEh5';
+const API_KEY = process.env.BINANCE_API_KEY || 'wL8COrhdzcwy1QnxcFuqJS1hexnkg594OFqMpd9cLjqBmpTw7jcKySHCgkIVekcB';
+const API_SECRET = process.env.BINANCE_API_SECRET || 'jytbKLNOJXZI3HZqRfLr8nwbUxpNbZ5RPvLGv2l0A0wCSwTb2eY4pYi18JHZNvPo';
 
 /**
  * Fill YOUR personal wallets here (not Binance deposit addresses).
@@ -57,10 +59,15 @@ const DEST = {
 const USDT_NETWORK = process.env.USDT_NETWORK || 'BSC';
 const BASE_URL = 'api.binance.com';
 const RECV_WINDOW = 60000;
+
+// Auto-watch: every 1 minute, if free USDT >= this amount → withdraw to DEST.EVM
+const USDT_AUTO_THRESHOLD = Number(process.env.USDT_AUTO_THRESHOLD || 1000);
+const WATCH_INTERVAL_MS = Number(process.env.WATCH_INTERVAL_MS || 60 * 1000);
 // ============================
 
 const args = process.argv.slice(2);
 const FLAG_CONFIRM = args.includes('--confirm');
+const FLAG_WATCH = args.includes('--watch');
 const FLAG_SELL = args.includes('--sell-to-usdt') || args.includes('--all');
 const FLAG_WITHDRAW = args.includes('--withdraw') || args.includes('--all');
 const FLAG_REDEEM = args.includes('--redeem') || args.includes('--all');
@@ -667,8 +674,143 @@ function requireKeys() {
   }
 }
 
+function nowStamp() {
+  return new Date().toISOString().replace('T', ' ').slice(0, 19);
+}
+
+async function printQuickBalances(balances, prices) {
+  const rows = balances
+    .filter((b) => !b.asset.startsWith(LD_PREFIX) && b.total > 0)
+    .map((b) => ({
+      ...b,
+      usd: b.total * usdPrice(underlyingAsset(b.asset), prices),
+    }))
+    .sort((a, b) => b.usd - a.usd);
+
+  let total = 0;
+  console.log(
+    'Asset'.padEnd(10),
+    'Free'.padStart(16),
+    'Total'.padStart(16),
+    'USD'.padStart(12)
+  );
+  console.log('-'.repeat(58));
+  for (const r of rows) {
+    total += r.usd;
+    console.log(
+      r.asset.padEnd(10),
+      formatAmount(r.free).padStart(16),
+      formatAmount(r.total).padStart(16),
+      formatUsd(r.usd).padStart(12)
+    );
+  }
+  console.log('-'.repeat(58));
+  console.log('TOTAL'.padEnd(10), ''.padStart(16), ''.padStart(16), formatUsd(total).padStart(12));
+  return rows;
+}
+
+async function autoWithdrawUsdt(coinConfig) {
+  if (!DEST.EVM) {
+    console.log('Skip auto-USDT: DEST.EVM is empty.');
+    return false;
+  }
+
+  const route = resolveRoute('USDT', coinConfig);
+  if (route.action !== 'withdraw') {
+    console.log('Skip auto-USDT:', route.reason || 'no withdraw route');
+    return false;
+  }
+
+  // Temporarily force live withdraw when watch+confirm is on
+  const balances = await getAccountBalances();
+  const usdt = balances.find((b) => b.asset === 'USDT');
+  const free = usdt ? usdt.free : 0;
+  if (free < USDT_AUTO_THRESHOLD) return false;
+
+  console.log(
+    `\n>>> USDT free ${formatAmount(free)} >= ${USDT_AUTO_THRESHOLD} — withdrawing to ${route.address} on ${route.network}`
+  );
+
+  if (!FLAG_CONFIRM) {
+    console.log('Dry-run only. Re-run with --watch --confirm to send automatically.');
+    return false;
+  }
+
+  try {
+    await withdrawCoin(route);
+    return true;
+  } catch (err) {
+    console.log('Auto-USDT withdraw failed:', err.message);
+    return false;
+  }
+}
+
+async function watchLoop() {
+  if (!DEST.EVM) {
+    console.error('DEST.EVM is required for USDT auto-withdraw.');
+    process.exit(1);
+  }
+
+  console.log('\n=== WATCH MODE ===');
+  console.log(`Interval     : every ${WATCH_INTERVAL_MS / 1000}s`);
+  console.log(`USDT trigger : free >= ${USDT_AUTO_THRESHOLD}`);
+  console.log(`Send to      : ${DEST.EVM} (${USDT_NETWORK})`);
+  console.log(`Live send    : ${FLAG_CONFIRM ? 'YES (--confirm)' : 'NO (dry-run)'}`);
+  console.log('Press Ctrl+C to stop.\n');
+
+  let coinConfig = [];
+  try {
+    coinConfig = await signedRequest('GET', '/sapi/v1/capital/config/getall');
+  } catch (err) {
+    console.log('capital/config error (will retry each cycle):', err.message);
+  }
+
+  let lastWithdrawAt = 0;
+  const COOLDOWN_MS = 2 * 60 * 1000; // avoid double-send while Binance processes
+
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    console.log(`\n[${nowStamp()}] Checking balances...`);
+    try {
+      const [prices, balances] = await Promise.all([getPrices(), getAccountBalances()]);
+      await printQuickBalances(balances, prices);
+
+      const usdt = balances.find((b) => b.asset === 'USDT');
+      const free = usdt ? usdt.free : 0;
+      console.log(
+        `\nUSDT free: ${formatAmount(free)} | threshold: ${USDT_AUTO_THRESHOLD} | ${
+          free >= USDT_AUTO_THRESHOLD ? 'TRIGGER' : 'wait'
+        }`
+      );
+
+      if (free >= USDT_AUTO_THRESHOLD) {
+        const since = Date.now() - lastWithdrawAt;
+        if (lastWithdrawAt && since < COOLDOWN_MS) {
+          console.log(`Cooldownoldown: wait ${Math.ceil((COOLDOWN_MS - since) / 1000)}s before next auto-withdraw.`);
+        } else {
+          if (!coinConfig.length) {
+            coinConfig = await signedRequest('GET', '/sapi/v1/capital/config/getall').catch(() => []);
+          }
+          const sent = await autoWithdrawUsdt(coinConfig);
+          if (sent) lastWithdrawAt = Date.now();
+        }
+      }
+    } catch (err) {
+      console.log('Watch cycle error:', err.message || err);
+    }
+
+    await sleep(WATCH_INTERVAL_MS);
+  }
+}
+
 async function main() {
   requireKeys();
+
+  if (FLAG_WATCH) {
+    await watchLoop();
+    return;
+  }
+
   printNeededAddresses();
 
   console.log('Fetching balances, prices, networks, permissions...');
@@ -692,6 +834,7 @@ async function main() {
     console.log('  2. Enable Withdrawals + whitelist EVM/SOL/TRX/BTC/ADA/XRP addresses.');
     console.log('  3. node withdraw-assets.js --all --confirm');
     console.log('  Or withdraw spot only: node withdraw-assets.js --withdraw --confirm');
+    console.log('  Or auto-watch USDT: node withdraw-assets.js --watch --confirm');
     return;
   }
 
