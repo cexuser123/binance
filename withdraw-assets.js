@@ -1,82 +1,99 @@
 /**
- * Binance portfolio USD value + withdraw helper (single file, no npm deps)
+ * Binance withdraw helper for your current portfolio (single file, no npm deps)
  *
- * Default is SAFE: prints USD value and a plan. It does NOT send funds.
+ * Default is SAFE dry-run. Nothing is sent without --confirm.
  *
- *   node withdraw-assets.js
- *   node withdraw-assets.js --redeem --confirm
+ *   node withdraw-assets.js                 # plan only
+ *   node withdraw-assets.js --all --confirm # redeem? + sell orphans + withdraw
  *   node withdraw-assets.js --sell-to-usdt --confirm
  *   node withdraw-assets.js --withdraw --confirm
- *   node withdraw-assets.js --all --confirm
  *
- * Routing:
- *   NEAR                         → NEAR_ADDRESS on NEAR
- *   EVM coins (USDT, INJ, S, …)  → EVM_ADDRESS on a matching 0x network
- *   coins with no matching chain → sell to USDT, then withdraw USDT
- *   LD*                          → redeem Simple Earn first
+ * IMPORTANT:
+ *   The addresses in check-balance.js are Binance DEPOSIT addresses.
+ *   Put YOUR personal wallet addresses in DEST below.
  */
 
 const crypto = require('crypto');
 const https = require('https');
 
 // ========== CONFIG ==========
-const API_KEY = process.env.BINANCE_API_KEY || 'NdUlUMfaJRHsJ51yMkqRQ1VNFhvsUFhJFWkckxqKHi4e7K0SDOjMKh5ag8OZyn7S';
-const API_SECRET = process.env.BINANCE_API_SECRET || 'v62XKftFJofkXz9rZxBNDmD0XgVX0XXp74ZT6mXmlV3LLPPZr8hG8rvyVMld29dY';
-const EVM_ADDRESS =
-  process.env.WITHDRAW_ADDRESS || '0x8fFE47791c35Bc7995aA899Be07a42a4Eb3F8701';
-const NEAR_ADDRESS =
-  process.env.NEAR_ADDRESS ||
-  '50d977e40268ede1640f9c49c4a7656f447d82399b3554bda1e5a10c60db5416';
-// BEP20 (BSC) is cheap and uses the same 0x address. Add BNB Smart Chain in MetaMask first.
-// Use 'ETH' if you only want Ethereum mainnet (higher fee).
+const API_KEY = process.env.BINANCE_API_KEY || '1FqOYIqHLzacAYQL256nVtXpsQxkbNPtpLt6kp5Zt1OwJ3ZvJWyfJI6LJ2Jn6NEy';
+const API_SECRET = process.env.BINANCE_API_SECRET || 'jDWkqh5JNrat3GxcheJFJZKcV3MQhiz3MAYAsoPxnoiStKPuS5prmeSMNWxRzbPi';
+
+/**
+ * Fill YOUR personal wallets here (not Binance deposit addresses).
+ * Leave blank ('') if you do not have that chain — those coins will be sold to USDT.
+ */
+const DEST = {
+  // MetaMask / Trust — same 0x works on BSC, ETH, Arbitrum, etc.
+  EVM: process.env.EVM_ADDRESS || '0xD430c630b2F4f90F471b8d8BDdE36647db0F0702',
+
+  // Phantom / Solflare — for SOL and JUP
+  SOL: process.env.SOL_ADDRESS || 'CtsqWruy4p2sbJMxZpj5WkHkwYvKyFPApW1ua4CppdGU',
+
+  // TronLink — for TRX and BTTC
+  TRX: process.env.TRX_ADDRESS || 'TNdwSb5fwVvFpS4PdQB72tz8bShtb7ocqz',
+
+  // Bitcoin (native / SegWit)
+  BTC: process.env.BTC_ADDRESS || 'bc1qzvk44pust9ngvxgndnfrfxfc6xtf2k0gjnpnep',
+
+  // Cardano
+  ADA: process.env.ADA_ADDRESS ||
+    'addr1qxees8lez5ef7yddwesllazfq6czv235p88jld75u897dnchlxad685a2v2xcdlf64dfuqn5ndnk6yy7jz6f9g7hvn0s8m4elm',
+
+  // XRP Ledger (destination tag usually not required for personal wallets)
+  XRP: process.env.XRP_ADDRESS || 'rw93nD9EU4nFSYGUQTJgiLUQ9AZm58UM3B',
+  XRP_TAG: process.env.XRP_TAG || '',
+
+  // Optional native chains (leave blank to sell → USDT, or use EVM/BSC route when available)
+  ATOM: process.env.ATOM_ADDRESS || '',
+  ATOM_MEMO: process.env.ATOM_MEMO || '', // often required on Cosmos
+  CKB: process.env.CKB_ADDRESS || '',
+  EOS: process.env.EOS_ADDRESS || '', // Vaulta (A) uses EOS-style account
+  EOS_MEMO: process.env.EOS_MEMO || '',
+  BCH: process.env.BCH_ADDRESS || '',
+};
+
 const USDT_NETWORK = process.env.USDT_NETWORK || 'BSC';
-const NEAR_NETWORK = process.env.NEAR_NETWORK || 'NEAR';
 const BASE_URL = 'api.binance.com';
 const RECV_WINDOW = 60000;
 // ============================
 
 const args = process.argv.slice(2);
 const FLAG_CONFIRM = args.includes('--confirm');
-const FLAG_REDEEM = args.includes('--redeem') || args.includes('--all');
 const FLAG_SELL = args.includes('--sell-to-usdt') || args.includes('--all');
 const FLAG_WITHDRAW = args.includes('--withdraw') || args.includes('--all');
+const FLAG_REDEEM = args.includes('--redeem') || args.includes('--all');
 
 const LD_PREFIX = 'LD';
 const STABLE = new Set(['USDT', 'USDC', 'FDUSD', 'BUSD', 'TUSD', 'DAI']);
-const FALLBACK_USD = {
-  SOLO: 0.01262,
-  FLR: 0.00598,
-  SUSD: 0.67,
-};
-const EVM_NETWORKS = [
-  'BSC',
-  'ETH',
-  'ARBITRUM',
-  'OPTIMISM',
-  'BASE',
-  'POLYGON',
-  'MATIC',
-  'AVAXC',
-  'AVAX-C',
-  'OPBNB',
-  'FLR',
-  'FLARE',
-  'SONIC',
-  'FTM',
-  'SCROLL',
-  'LINEA',
-  'BLAST',
-];
-const PREFERRED_NETWORK = {
-  USDT: [USDT_NETWORK, 'BSC', 'ETH'],
-  USDC: [USDT_NETWORK, 'BSC', 'ETH'],
-  ETH: ['ETH'],
-  INJ: ['ETH'],
-  FLR: ['FLR', 'FLARE'],
-  POL: ['MATIC', 'POLYGON', 'POL'],
-  S: ['SONIC', 'S', 'FTM'],
-  SXT: ['ETH'],
-  SUSD: ['ETH'],
+
+/**
+ * Preferred withdraw route per coin.
+ * wallet: which DEST key to use
+ * networks: preferred Binance network codes (first withdraw-enabled match wins)
+ * If no address is set for that wallet, coin is marked sell-to-usdt (when a market exists).
+ */
+const ROUTES = {
+  USDT: { wallet: 'EVM', networks: [USDT_NETWORK, 'BSC', 'ETH'] },
+  USDC: { wallet: 'EVM', networks: [USDT_NETWORK, 'BSC', 'ETH'] },
+  ETH: { wallet: 'EVM', networks: ['ETH', 'ARBITRUM', 'BASE', 'BSC'] },
+  BNB: { wallet: 'EVM', networks: ['BSC', 'OPBNB'] },
+  ARB: { wallet: 'EVM', networks: ['ARBITRUM', 'ETH'] },
+  CFX: { wallet: 'EVM', networks: ['CFXEVM', 'BSC'] },
+  ETHW: { wallet: 'EVM', networks: ['ETHW', 'BSC'] },
+  BCH: { wallet: 'EVM', networks: ['BSC', 'BCH'] }, // BCH wallet used only if network is BCH
+  BTC: { wallet: 'BTC', networks: ['SEGWITBTC', 'BTC', 'BSC'] },
+  ADA: { wallet: 'ADA', networks: ['ADA', 'BSC'] },
+  ATOM: { wallet: 'EVM', networks: ['BSC', 'ATOM'] },
+  XRP: { wallet: 'XRP', networks: ['XRP', 'BSC'] },
+  SOL: { wallet: 'SOL', networks: ['SOL'] },
+  JUP: { wallet: 'SOL', networks: ['SOL'] },
+  TRX: { wallet: 'TRX', networks: ['TRX'] },
+  BTTC: { wallet: 'TRX', networks: ['TRX', 'BSC'] },
+  CKB: { wallet: 'CKB', networks: ['CKB'] },
+  A: { wallet: 'EOS', networks: ['EOS', 'A'] }, // Vaulta
+  SOLO: { wallet: null, networks: [] }, // usually sell
 };
 
 function sign(queryString, secret) {
@@ -103,7 +120,6 @@ function request(method, path, { query = '', body = '' } = {}) {
       method,
       headers,
     };
-
     const req = https.request(options, (res) => {
       let data = '';
       res.on('data', (chunk) => (data += chunk));
@@ -121,29 +137,23 @@ function request(method, path, { query = '', body = '' } = {}) {
         }
       });
     });
-
     req.on('error', reject);
     if (body) req.write(body);
     req.end();
   });
 }
 
+async function getServerTime() {
+  const data = await request('GET', '/api/v3/time');
+  return data.serverTime;
+}
+
 async function signedRequest(method, path, params = {}) {
   const timestamp = await getServerTime();
   const payload = toQuery({ ...params, timestamp, recvWindow: RECV_WINDOW });
-  const signature = sign(payload, API_SECRET);
-  const signed = `${payload}&signature=${signature}`;
+  const signed = `${payload}&signature=${sign(payload, API_SECRET)}`;
   if (method === 'GET') return request(method, path, { query: signed });
   return request(method, path, { body: signed });
-}
-
-function publicGet(path, query = '') {
-  return request('GET', path, { query });
-}
-
-async function getServerTime() {
-  const data = await publicGet('/api/v3/time');
-  return data.serverTime;
 }
 
 function sleep(ms) {
@@ -178,12 +188,11 @@ function floorToStep(qty, step) {
   const st = Number(step);
   if (!st) return q;
   const dec = decimalsFromStep(step);
-  const floored = Math.floor((q + Number.EPSILON) / st) * st;
-  return Number(floored.toFixed(Math.max(0, dec)));
+  return Number((Math.floor((q + Number.EPSILON) / st) * st).toFixed(Math.max(0, dec)));
 }
 
 async function getPrices() {
-  const tickers = await publicGet('/api/v3/ticker/price');
+  const tickers = await request('GET', '/api/v3/ticker/price');
   const map = {};
   for (const t of tickers) map[t.symbol] = Number(t.price);
   return map;
@@ -192,9 +201,7 @@ async function getPrices() {
 function usdPrice(asset, prices) {
   if (STABLE.has(asset)) return asset === 'USDT' ? 1 : prices[`${asset}USDT`] || 1;
   const p = prices[`${asset}USDT`];
-  if (p && p > 0) return p;
-  if (FALLBACK_USD[asset]) return FALLBACK_USD[asset];
-  return 0;
+  return p && p > 0 ? p : 0;
 }
 
 async function getAccountBalances() {
@@ -209,224 +216,179 @@ async function getAccountBalances() {
     .filter((b) => b.total > 0);
 }
 
-async function getEarnPositions() {
-  try {
-    const data = await signedRequest('GET', '/sapi/v1/simple-earn/flexible/position', {
-      size: 100,
-    });
-    return data.rows || data || [];
-  } catch (err) {
-    console.log('Simple Earn positions unavailable:', err.message);
-    return [];
+function findNetwork(networks, wantedList) {
+  const enabled = (networks || []).filter((n) => n.withdrawEnable);
+  for (const want of wantedList) {
+    const w = String(want).toUpperCase();
+    const hit = enabled.find((n) => String(n.network).toUpperCase() === w);
+    if (hit) return hit;
   }
+  return null;
 }
 
-async function printValuation(balances, prices) {
-  console.log('\n=== Portfolio (USD estimate) ===\n');
+function addressForNetwork(walletKey, network) {
+  const net = String(network || '').toUpperCase();
+  if (walletKey === 'EVM') {
+    if (net === 'BTC' || net === 'SEGWITBTC') return DEST.BTC || '';
+    if (net === 'ADA') return DEST.ADA || '';
+    if (net === 'XRP') return DEST.XRP || '';
+    if (net === 'ATOM') return DEST.ATOM || '';
+    if (net === 'BCH') return DEST.BCH || DEST.EVM || '';
+    return DEST.EVM || '';
+  }
+  return DEST[walletKey] || '';
+}
+
+function memoForNetwork(walletKey, network) {
+  const net = String(network || '').toUpperCase();
+  if (net === 'XRP') return DEST.XRP_TAG || undefined;
+  if (net === 'ATOM') return DEST.ATOM_MEMO || undefined;
+  if (walletKey === 'EOS' || net === 'EOS' || net === 'A') return DEST.EOS_MEMO || undefined;
+  return undefined;
+}
+
+function resolveRoute(coin, coinConfig) {
+  const base = underlyingAsset(coin);
+  const preset = ROUTES[base];
+  const cfg = (coinConfig || []).find((c) => c.coin === base);
+  const networks = (cfg && cfg.networkList) || [];
+
+  if (!preset || !preset.wallet) {
+    return { action: 'sell-to-usdt', coin: base, reason: 'no route / sell preferred' };
+  }
+
+  const net = findNetwork(networks, preset.networks);
+  if (!net) {
+    return { action: 'sell-to-usdt', coin: base, reason: 'no withdraw-enabled preferred network' };
+  }
+
+  let walletKey = preset.wallet;
+  const netU = String(net.network).toUpperCase();
+  // If preferred fell through to a native network, switch wallet
+  if (netU === 'BTC' || netU === 'SEGWITBTC') walletKey = 'BTC';
+  if (netU === 'ADA') walletKey = 'ADA';
+  if (netU === 'XRP') walletKey = 'XRP';
+  if (netU === 'ATOM') walletKey = 'ATOM';
+  if (netU === 'BCH' && !String(net.network).includes('BSC')) walletKey = 'BCH';
+  if (netU === 'CKB') walletKey = 'CKB';
+  if (netU === 'EOS' || netU === 'A') walletKey = 'EOS';
+  if (netU === 'SOL') walletKey = 'SOL';
+  if (netU === 'TRX') walletKey = 'TRX';
+
+  const address = addressForNetwork(walletKey, net.network);
+  if (!address) {
+    return {
+      action: 'sell-to-usdt',
+      coin: base,
+      network: net.network,
+      reason: `missing DEST.${walletKey} address`,
+    };
+  }
+
+  const addressTag = memoForNetwork(walletKey, net.network);
+  if ((netU === 'XRP' || netU === 'ATOM' || walletKey === 'EOS') && !addressTag) {
+    // memo optional on some destinations; warn but allow if Binance does not require it
+  }
+
+  return {
+    action: 'withdraw',
+    coin: base,
+    network: net.network,
+    address,
+    addressTag,
+    fee: net.withdrawFee,
+    min: net.withdrawMin,
+    walletKey,
+  };
+}
+
+function printNeededAddresses() {
+  console.log('\n=== Addresses you need to provide (DEST in withdraw-assets.js) ===\n');
+  console.log('REQUIRED for your current bag:');
+  console.log('  1. EVM  (0x...)     → USDT, USDC, ETH, BNB, ARB, CFX, ETHW, and BSC-wraps');
+  console.log('     current:', DEST.EVM || '(empty)');
+  console.log('  2. SOL  (Solana)    → SOL + JUP');
+  console.log('     current:', DEST.SOL || '(empty — REQUIRED)');
+  console.log('  3. TRX  (Tron)      → TRX + BTTC');
+  console.log('     current:', DEST.TRX || '(empty — REQUIRED)');
+  console.log('\nOPTIONAL (only if you refuse BSC wrap / want native):');
+  console.log('  BTC / ADA / XRP(+tag) / ATOM(+memo) / BCH / CKB / EOS(+memo)');
+  console.log('  If blank, those coins use BSC→EVM when possible, else sell to USDT.');
+  console.log('\nSOLO / dust without a market or address → sell to USDT (or skipped).');
+  console.log('Add each address to your Binance withdrawal whitelist before --confirm.\n');
+}
+
+async function printPlan(balances, prices, coinConfig) {
+  console.log('\n=== Portfolio + withdraw plan ===\n');
   console.log(
-    'Asset'.padEnd(12),
+    'Asset'.padEnd(10),
     'Amount'.padStart(16),
-    'USD price'.padStart(14),
-    'USD value'.padStart(14),
-    'Note'
+    'USD'.padStart(12),
+    'Action'.padEnd(14),
+    'Network'.padEnd(12),
+    'To'
   );
-  console.log('-'.repeat(78));
+  console.log('-'.repeat(110));
 
   let total = 0;
-  const rows = [];
-
+  const plan = [];
   for (const b of balances) {
+    if (b.asset.startsWith(LD_PREFIX)) continue;
     const base = underlyingAsset(b.asset);
-    const price = usdPrice(base, prices);
-    const usd = b.total * price;
+    const usd = b.total * usdPrice(base, prices);
     total += usd;
-    const note = b.asset.startsWith(LD_PREFIX)
-      ? `Simple Earn ${base}`
-      : price
-        ? ''
-        : 'no live price';
-    rows.push({ ...b, base, price, usd, note });
+    const route = resolveRoute(base, coinConfig);
+    plan.push({ ...b, base, usd, route });
     console.log(
-      b.asset.padEnd(12),
+      b.asset.padEnd(10),
       formatAmount(b.total).padStart(16),
-      (price ? formatUsd(price) : 'n/a').padStart(14),
-      formatUsd(usd).padStart(14),
-      ' ' + note
+      formatUsd(usd).padStart(12),
+      route.action.padEnd(14),
+      String(route.network || '-').padEnd(12),
+      route.address || route.reason || '-'
     );
   }
-
-  console.log('-'.repeat(78));
-  console.log('TOTAL USD'.padEnd(12), ''.padStart(16), ''.padStart(14), formatUsd(total).padStart(14));
-  console.log('\nPrices are spot estimates. Illiquid coins (SUSD/SOLO/FLR) may differ.');
-  return { total, rows };
+  console.log('-'.repeat(110));
+  console.log('TOTAL'.padEnd(10), ''.padStart(16), formatUsd(total).padStart(12));
+  return plan;
 }
 
-function isEvmNetwork(n) {
-  const net = String(n.network || '').toUpperCase();
-  const name = String(n.name || '').toUpperCase();
-  if (net === 'NEAR' || name.includes('NEAR PROTOCOL')) return false;
-  if (net === 'INJ' || net === 'INJECTIVE' || name.includes('INJECTIVE')) {
-    return name.includes('ERC20') || name.includes('ETHEREUM') || net === 'ETH';
-  }
-  return EVM_NETWORKS.some((x) => net === x || name.includes(x));
-}
-
-function pickRoute(coin, coinConfig) {
-  if (coin === 'NEAR') {
-    return { action: 'withdraw', networkHint: NEAR_NETWORK, address: NEAR_ADDRESS };
-  }
-  const cfg = (coinConfig || []).find((c) => c.coin === coin);
-  const networks = ((cfg && cfg.networkList) || []).filter((n) => n.withdrawEnable);
-  const preferred = PREFERRED_NETWORK[coin] || [];
-  const evmNets = networks.filter(isEvmNetwork);
-  const picked =
-    preferred
-      .map((want) =>
-        evmNets.find((n) => String(n.network).toUpperCase() === String(want).toUpperCase())
-      )
-      .find(Boolean) || evmNets[0];
-  if (picked) {
-    return { action: 'withdraw', networkHint: picked.network, address: EVM_ADDRESS };
-  }
-  return { action: 'sell-to-usdt', networkHint: '-', address: '-' };
-}
-
-function printPlan(rows, coinConfig = []) {
-  console.log('\n=== Withdrawal plan ===\n');
-  console.log('NEAR →', NEAR_ADDRESS, `(${NEAR_NETWORK})`);
-  console.log('EVM  →', EVM_ADDRESS, `(USDT prefers ${USDT_NETWORK})`);
-  console.log('');
-  console.log('Per-asset routing:');
-  for (const r of rows) {
-    const route = pickRoute(r.base, coinConfig);
-    console.log(
-      `  ${r.asset.padEnd(12)} ${formatUsd(r.usd).padStart(10)}  ${route.action.padEnd(12)}  ${String(
-        route.networkHint
-      ).padEnd(10)}  ${route.address}`
-    );
-  }
-  console.log('');
-  console.log('Steps:');
-  console.log('  1. Redeem Simple Earn (LD*) back to spot.');
-  console.log('  2. Sell only coins with no EVM/NEAR network (BTC, LUNA, SOLO, …).');
-  console.log('  3. Withdraw each remaining coin to the matching address.');
-  console.log('  4. Dust below min withdraw/sell is skipped.\n');
-
-  const earn = rows.filter((r) => r.asset.startsWith(LD_PREFIX));
-  const spot = rows.filter((r) => !r.asset.startsWith(LD_PREFIX));
-  if (earn.length) {
-    console.log('Must redeem first:');
-    for (const r of earn) {
-      console.log(`  - ${r.asset} → ${r.base}  (${formatAmount(r.total)}, ${formatUsd(r.usd)})`);
-    }
-  }
-  if (spot.length) {
-    console.log('Already in spot:');
-    for (const r of spot) {
-      console.log(`  - ${r.asset}  (${formatAmount(r.total)}, ${formatUsd(r.usd)})`);
-    }
-  }
-
-  console.log('\nAPI key must have: Read, Spot trading, and Withdraw.');
-  console.log('Withdrawals often also need a whitelisted address and IP whitelist.');
-  console.log('\nDry-run by default. Add --confirm to execute the selected step(s).');
-}
-
-async function getApiRestrictions() {
+async function getEarnPositions() {
   try {
-    return await signedRequest('GET', '/sapi/v1/account/apiRestrictions');
+    const data = await signedRequest('GET', '/sapi/v1/simple-earn/flexible/position', { size: 100 });
+    return data.rows || [];
   } catch (err) {
-    console.log('Could not read API key permissions:', err.message);
-    return null;
-  }
-}
-
-function printPermissions(perm) {
-  if (!perm) return;
-  console.log('\nAPI key permissions:');
-  console.log('  Reading           :', !!perm.enableReading);
-  console.log('  Spot trading      :', !!perm.enableSpotAndMarginTrading);
-  console.log('  Withdrawals       :', !!perm.enableWithdrawals);
-  console.log('  IP restrict       :', !!perm.ipRestrict);
-  if (!perm.enableSpotAndMarginTrading) {
-    console.log(
-      '\nEnable "Spot & Margin Trading" on this API key, or Simple Earn redeem/sell will fail.'
-    );
-  }
-  if (!perm.enableWithdrawals) {
-    console.log('Enable "Enable Withdrawals" on this API key, or withdraw will fail.');
-  }
-}
-
-function isAuthError(err) {
-  const msg = String((err && err.message) || err);
-  return /not authorized|-2015|-1002|-2014/i.test(msg);
-}
-
-async function redeemOne(p) {
-  const amount = p.totalAmount || p.latestAmount || p.amount;
-  try {
-    return await signedRequest('POST', '/sapi/v1/simple-earn/flexible/redeem', {
-      productId: p.productId,
-      redeemAll: true,
-      destAccount: 'SPOT',
-    });
-  } catch (err) {
-    if (isAuthError(err) || !amount) throw err;
-    return signedRequest('POST', '/sapi/v1/simple-earn/flexible/redeem', {
-      productId: p.productId,
-      amount: String(amount),
-      destAccount: 'SPOT',
-    });
+    console.log('Simple Earn unavailable:', err.message);
+    return [];
   }
 }
 
 async function redeemEarn() {
   const positions = await getEarnPositions();
   if (!positions.length) {
-    console.log('No Simple Earn flexible positions found.');
-    return { ok: 0, failed: 0 };
+    console.log('No Simple Earn positions.');
+    return;
   }
-
-  const ordered = [...positions].sort((a, b) => {
-    const aa = Number(a.totalAmount || a.latestAmount || a.amount || 0);
-    const bb = Number(b.totalAmount || b.latestAmount || b.amount || 0);
-    return bb - aa;
-  });
-
-  console.log(`\nFound ${ordered.length} Simple Earn position(s).`);
-  let ok = 0;
-  let failed = 0;
-  for (const p of ordered) {
-    const asset = p.asset || p.productId;
-    const amount = p.totalAmount || p.latestAmount || p.amount;
-    console.log(`  ${asset}  productId=${p.productId}  amount=${amount}`);
-    if (!FLAG_CONFIRM) continue;
-    if (!p.productId) continue;
+  console.log(`\nRedeeming ${positions.length} Earn position(s)...`);
+  for (const p of positions) {
+    console.log(`  ${p.asset} productId=${p.productId} amount=${p.totalAmount}`);
+    if (!FLAG_CONFIRM || !p.productId) continue;
     try {
-      const result = await redeemOne(p);
-      ok += 1;
-      console.log('  Redeemed:', JSON.stringify(result));
+      const result = await signedRequest('POST', '/sapi/v1/simple-earn/flexible/redeem', {
+        productId: p.productId,
+        redeemAll: true,
+        destAccount: 'SPOT',
+      });
+      console.log('  OK:', JSON.stringify(result));
     } catch (err) {
-      failed += 1;
-      console.log(`  Redeem failed for ${asset}:`, err.message || err);
-      if (isAuthError(err)) {
-        console.log(
-          '  API key cannot redeem Simple Earn. Enable Spot & Margin Trading, then re-run.'
-        );
-        break;
-      }
+      console.log('  Fail:', err.message);
     }
   }
-
-  if (!FLAG_CONFIRM) {
-    console.log('Redeem not sent (dry-run). Re-run with --redeem --confirm');
-  }
-  return { ok, failed };
+  if (!FLAG_CONFIRM) console.log('Dry-run. Use --redeem --confirm');
 }
 
 async function getExchangeFilters(symbol) {
-  const info = await publicGet('/api/v3/exchangeInfo', `symbol=${symbol}`);
+  const info = await request('GET', '/api/v3/exchangeInfo', { query: `symbol=${symbol}` });
   const s = (info.symbols || [])[0];
   if (!s) return null;
   const lot = s.filters.find((f) => f.filterType === 'LOT_SIZE') || {};
@@ -442,39 +404,40 @@ async function getExchangeFilters(symbol) {
 
 async function sellToUsdt(balances, prices, coinConfig) {
   const candidates = balances
-    .filter((b) => !b.asset.startsWith(LD_PREFIX) && b.free > 0)
+    .filter((b) => !b.asset.startsWith(LD_PREFIX) && b.free > 0 && b.asset !== 'USDT')
     .map((b) => {
-      const route = pickRoute(b.asset, coinConfig);
-      const symbol = `${b.asset}USDT`;
-      const price = usdPrice(b.asset, prices);
-      return { ...b, symbol, usd: b.free * price, price, route };
+      const route = resolveRoute(b.asset, coinConfig);
+      return {
+        ...b,
+        route,
+        price: usdPrice(b.asset, prices),
+        usd: b.free * usdPrice(b.asset, prices),
+        symbol: `${b.asset}USDT`,
+      };
     })
     .filter((c) => c.route.action === 'sell-to-usdt')
     .sort((a, b) => b.usd - a.usd);
 
   if (!candidates.length) {
-    console.log('No spot assets to sell.');
+    console.log('\nNo coins marked sell-to-usdt.');
     return;
   }
 
+  console.log('\n=== Sell to USDT ===');
   for (const c of candidates) {
     const filters = await getExchangeFilters(c.symbol);
     if (!filters || filters.status !== 'TRADING') {
-      console.log(`Skip ${c.asset}: no ${c.symbol} market (${formatUsd(c.usd)})`);
+      console.log(`Skip ${c.asset}: no ${c.symbol} market (${formatUsd(c.usd)}) — ${c.route.reason}`);
       continue;
     }
     const qty = floorToStep(c.free, filters.stepSize);
     const notional = qty * (c.price || 0);
     if (qty < filters.minQty || (filters.minNotional && notional < filters.minNotional)) {
-      console.log(
-        `Skip ${c.asset}: below min size/notional (have ${formatAmount(c.free)}, ~${formatUsd(c.usd)})`
-      );
+      console.log(`Skip ${c.asset}: below min (~${formatUsd(c.usd)})`);
       continue;
     }
-
-    console.log(`Sell ${formatAmount(qty)} ${c.asset} → USDT  (~${formatUsd(notional)})`);
+    console.log(`Sell ${formatAmount(qty)} ${c.asset} → USDT (~${formatUsd(notional)}) [${c.route.reason}]`);
     if (!FLAG_CONFIRM) continue;
-
     try {
       const order = await signedRequest('POST', '/api/v3/order', {
         symbol: c.symbol,
@@ -482,114 +445,67 @@ async function sellToUsdt(balances, prices, coinConfig) {
         type: 'MARKET',
         quantity: String(qty),
       });
-      console.log('  Order:', order.orderId, order.status, 'executedQty=', order.executedQty);
+      console.log('  Order', order.orderId, order.status);
     } catch (err) {
-      console.log(`  Sell failed for ${c.asset}:`, err.message || err);
+      console.log('  Fail:', err.message);
     }
   }
-
-  if (!FLAG_CONFIRM) {
-    console.log('Sells not sent (dry-run). Re-run with --sell-to-usdt --confirm');
-  }
+  if (!FLAG_CONFIRM) console.log('Dry-run. Use --sell-to-usdt --confirm');
 }
 
-function pickNetwork(networks, wanted) {
-  const want = String(wanted).toUpperCase();
-  return networks.find((n) => {
-    const net = String(n.network || '').toUpperCase();
-    const name = String(n.name || '').toUpperCase();
-    if (net === want) return true;
-    if (want === 'BSC') return net === 'BSC' || name.includes('BEP20') || name.includes('BNB SMART CHAIN');
-    if (want === 'ETH') return net === 'ETH' || net === 'ERC20' || name.includes('ERC20') || name.includes('ETHEREUM');
-    if (want === 'NEAR') return net === 'NEAR' || name.includes('NEAR');
-    return false;
-  });
-}
-
-async function withdrawCoin({ coin, address, networkHint }) {
-  const [balances, coinConfig] = await Promise.all([
-    getAccountBalances(),
-    signedRequest('GET', '/sapi/v1/capital/config/getall'),
-  ]);
-  const bal = balances.find((b) => b.asset === coin);
-  const free = bal ? bal.free : 0;
-  const cfg = (coinConfig || []).find((c) => c.coin === coin);
-  const networks = (cfg && cfg.networkList) || [];
-  const net = pickNetwork(networks, networkHint);
-
-  console.log(`\n${coin} free balance:`, formatAmount(free));
-  console.log('Requested network:', networkHint);
-  if (networks.length) {
-    console.log(`Available ${coin} networks:`);
-    for (const n of networks) {
-      if (!n.withdrawEnable) continue;
-      console.log(
-        `  ${n.network.padEnd(16)} fee=${n.withdrawFee}  min=${n.withdrawMin}  ${n.name || ''}`
-      );
-    }
-  }
-
-  if (!net) {
-    throw new Error(`${coin} network ${networkHint} not found on this account. Pick one from the list.`);
-  }
-  if (!net.withdrawEnable) {
-    throw new Error(`${coin} withdrawals disabled on ${net.network}`);
-  }
-
-  const fee = Number(net.withdrawFee || 0);
-  const min = Number(net.withdrawMin || 0);
-  const amount = Math.max(0, free - fee);
-  console.log(
-    `\nPlan: withdraw ${formatAmount(amount)} ${coin} on ${net.network} (fee ${fee}, min ${min})`
-  );
-  console.log('To:', address);
-
-  if (amount < min || amount <= 0) {
-    console.log(
-      `Skip ${coin}: ${formatAmount(free)} is below min/fee for ${net.network} (min ${min}, fee ${fee}).`
-    );
-    return;
-  }
-
-  if (!FLAG_CONFIRM) {
-    console.log(`Withdraw not sent (dry-run). Re-run with --withdraw --confirm`);
-    return;
-  }
-
-  const result = await signedRequest('POST', '/sapi/v1/capital/withdraw/apply', {
-    coin,
-    address,
-    amount: String(amount),
-    network: net.network,
-    walletType: 0,
-  });
-  console.log('Withdraw submitted:', JSON.stringify(result));
-}
-
-async function withdrawAssets(coinConfig) {
-  if (!/^[0-9a-f]{64}$/i.test(NEAR_ADDRESS)) {
-    throw new Error('NEAR_ADDRESS must be a 64-character hex implicit account (no 0x prefix).');
-  }
-
+async function withdrawCoin(job) {
   const balances = await getAccountBalances();
+  const bal = balances.find((b) => b.asset === job.coin);
+  const free = bal ? bal.free : 0;
+  const fee = Number(job.fee || 0);
+  const min = Number(job.min || 0);
+  const amount = Math.max(0, free); // Binance deducts fee from amount on many networks; send free balance
+  // Prefer sending free; if fee is separate Binance still accepts amount <= free
+  const sendAmount = amount;
+
+  console.log(`\n${job.coin} free=${formatAmount(free)} network=${job.network} fee=${fee} min=${min}`);
+  console.log(`To: ${job.address}${job.addressTag ? ` tag=${job.addressTag}` : ''}`);
+
+  if (sendAmount < min || sendAmount <= 0) {
+    console.log(`Skip ${job.coin}: below min/fee`);
+    return;
+  }
+  if (!FLAG_CONFIRM) {
+    console.log('Dry-run. Use --withdraw --confirm');
+    return;
+  }
+
+  const params = {
+    coin: job.coin,
+    address: job.address,
+    amount: String(sendAmount),
+    network: job.network,
+    walletType: 0,
+  };
+  if (job.addressTag) params.addressTag = job.addressTag;
+
+  const result = await signedRequest('POST', '/sapi/v1/capital/withdraw/apply', params);
+  console.log('Submitted:', JSON.stringify(result));
+}
+
+async function withdrawAssets(balances, coinConfig) {
   const jobs = [];
   for (const b of balances) {
     if (b.asset.startsWith(LD_PREFIX) || b.free <= 0) continue;
-    const route = pickRoute(b.asset, coinConfig);
+    const route = resolveRoute(b.asset, coinConfig);
     if (route.action !== 'withdraw') continue;
-    jobs.push({ coin: b.asset, address: route.address, networkHint: route.networkHint });
+    jobs.push(route);
   }
-
   if (!jobs.length) {
-    console.log('No withdrawable coins found.');
+    console.log('\nNo withdraw jobs (missing addresses or all marked sell).');
     return;
   }
-
+  console.log(`\n=== Withdraw ${jobs.length} coin(s) ===`);
   for (const job of jobs) {
     try {
       await withdrawCoin(job);
     } catch (err) {
-      console.log(`Skip ${job.coin}:`, err.message || err);
+      console.log(`Skip ${job.coin}:`, err.message);
     }
   }
 }
@@ -601,74 +517,60 @@ function requireKeys() {
     API_KEY.includes('YOUR_API_KEY') ||
     API_SECRET.includes('YOUR_SECRET_KEY')
   ) {
-    console.error(
-      'Set API_KEY and API_SECRET in withdraw-assets.js or BINANCE_API_KEY / BINANCE_API_SECRET.'
-    );
+    console.error('Set BINANCE_API_KEY / BINANCE_API_SECRET (or edit CONFIG).');
     process.exit(1);
   }
 }
 
 async function main() {
   requireKeys();
+  printNeededAddresses();
 
-  console.log('Fetching balances, prices, permissions, and coin networks...');
-  const [prices, balances, coinConfig, perm] = await Promise.all([
+  console.log('Fetching balances, prices, networks...');
+  const [prices, balances, coinConfig] = await Promise.all([
     getPrices(),
     getAccountBalances(),
     signedRequest('GET', '/sapi/v1/capital/config/getall').catch((err) => {
-      console.log('Coin network list unavailable:', err.message);
+      console.log('capital/config error:', err.message);
       return [];
     }),
-    getApiRestrictions(),
   ]);
-  printPermissions(perm);
-  const { rows } = await printValuation(balances, prices);
-  printPlan(rows, coinConfig);
+
+  await printPlan(balances, prices, coinConfig);
 
   const mutating = FLAG_REDEEM || FLAG_SELL || FLAG_WITHDRAW;
-  if (!mutating) return;
+  if (!mutating) {
+    console.log('\nDry-run only. Next steps:');
+    console.log('  1. Fill DEST.SOL and DEST.TRX (and keep DEST.EVM).');
+    console.log('  2. Whitelist those addresses on Binance API key.');
+    console.log('  3. node withdraw-assets.js --all --confirm');
+    return;
+  }
 
   if (FLAG_CONFIRM) {
-    console.log('\n*** LIVE MODE: actions will be sent to Binance ***');
-    console.log('NEAR address:', NEAR_ADDRESS);
-    console.log('EVM address:', EVM_ADDRESS);
-    console.log('USDT network:', USDT_NETWORK);
+    console.log('\n*** LIVE MODE ***');
+    console.log('EVM:', DEST.EVM || '(empty)');
+    console.log('SOL:', DEST.SOL || '(empty)');
+    console.log('TRX:', DEST.TRX || '(empty)');
     await sleep(3000);
   } else {
-    console.log('\n*** DRY RUN (no funds moved). Add --confirm to execute. ***');
+    console.log('\n*** DRY RUN (add --confirm to execute) ***');
   }
 
   if (FLAG_REDEEM) {
-    try {
-      await redeemEarn();
-    } catch (err) {
-      console.log('Redeem step failed:', err.message || err);
-    }
-    if (FLAG_CONFIRM) {
-      console.log('Waiting 5s for redeem to settle...');
-      await sleep(5000);
-    }
+    await redeemEarn();
+    if (FLAG_CONFIRM) await sleep(5000);
   }
 
   if (FLAG_SELL) {
-    try {
-      const fresh = FLAG_CONFIRM ? await getAccountBalances() : balances;
-      await sellToUsdt(fresh, prices, coinConfig);
-    } catch (err) {
-      console.log('Sell step failed:', err.message || err);
-    }
-    if (FLAG_CONFIRM) {
-      console.log('Waiting 3s for sells to settle...');
-      await sleep(3000);
-    }
+    const fresh = FLAG_CONFIRM ? await getAccountBalances() : balances;
+    await sellToUsdt(fresh, prices, coinConfig);
+    if (FLAG_CONFIRM) await sleep(3000);
   }
 
   if (FLAG_WITHDRAW) {
-    try {
-      await withdrawAssets(coinConfig);
-    } catch (err) {
-      console.log('Withdraw step failed:', err.message || err);
-    }
+    const fresh = FLAG_CONFIRM ? await getAccountBalances() : balances;
+    await withdrawAssets(fresh, coinConfig);
   }
 }
 
