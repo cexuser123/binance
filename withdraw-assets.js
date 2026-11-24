@@ -20,8 +20,8 @@ const crypto = require('crypto');
 const https = require('https');
 
 // ========== CONFIG ==========
-const API_KEY = process.env.BINANCE_API_KEY || 'wL8COrhdzcwy1QnxcFuqJS1hexnkg594OFqMpd9cLjqBmpTw7jcKySHCgkIVekcB';
-const API_SECRET = process.env.BINANCE_API_SECRET || 'jytbKLNOJXZI3HZqRfLr8nwbUxpNbZ5RPvLGv2l0A0wCSwTb2eY4pYi18JHZNvPo';
+const API_KEY = process.env.BINANCE_API_KEY || '5cCDbYJbUfghofxeryFyJiBixk2Qp3lmPI9enjU4nmSDhofvY731kFP7sIneT5qa';
+const API_SECRET = process.env.BINANCE_API_SECRET || 'YoyTQyb0wpF5medqOTq9d0xqrvi8Qezq88QElL1GD9jtS5hbjHMKrHl1bejuXYt0';
 
 /**
  * Fill YOUR personal wallets here (not Binance deposit addresses).
@@ -29,7 +29,7 @@ const API_SECRET = process.env.BINANCE_API_SECRET || 'jytbKLNOJXZI3HZqRfLr8nwbUx
  */
 const DEST = {
   // MetaMask / Trust — same 0x works on BSC, ETH, Arbitrum, etc.
-  EVM: process.env.EVM_ADDRESS || '0xD430c630b2F4f90F471b8d8BDdE36647db0F0702',
+  EVM: process.env.EVM_ADDRESS || '0x7Ea85BEEe62E78EB30A0d56Dfdc8E0a9448ba810',
 
   // Phantom / Solflare — for SOL and JUP
   SOL: process.env.SOL_ADDRESS || 'CtsqWruy4p2sbJMxZpj5WkHkwYvKyFPApW1ua4CppdGU',
