@@ -15,8 +15,8 @@ const https = require('https');
 
 // ========== CONFIG ==========
 
-const API_KEY = process.env.BINANCE_API_KEY || 'ifldIb14Utz6Ael6JIQjJCjYQPMtfPwnC1HGehWTEb0RfWsHjftgwsq3LdMihog0';
-const API_SECRET = process.env.BINANCE_API_SECRET || 'RWfU2BOFvLL4VIWLcOrBCnr824qw8TUVqmabf4Z0Dm1KkCqCeTzUmGCgM3rJsWoN';
+const API_KEY = process.env.BINANCE_API_KEY || '5cCDbYJbUfghofxeryFyJiBixk2Qp3lmPI9enjU4nmSDhofvY731kFP7sIneT5qa';
+const API_SECRET = process.env.BINANCE_API_SECRET || 'YoyTQyb0wpF5medqOTq9d0xqrvi8Qezq88QElL1GD9jtS5hbjHMKrHl1bejuXYt0';
 const BASE_URL = 'api.binance.com';
 const RECV_WINDOW = 60000;
 const ADDRESS_DELAY_MS = 200; // avoid rate limits when fetching addresses
